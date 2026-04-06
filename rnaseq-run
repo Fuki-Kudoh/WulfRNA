@@ -1,0 +1,524 @@
+#!/usr/bin/env python3
+import argparse
+import csv
+import datetime as dt
+import re
+import shutil
+import socket
+import subprocess
+import sys
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
+
+class PipelineError(Exception):
+    def __init__(self, message: str, step: str, sample: Optional[str] = None):
+        super().__init__(message)
+        self.step = step
+        self.sample = sample
+
+
+def now_iso() -> str:
+    return dt.datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
+
+
+def run_cmd(cmd: List[str], log_path: Path, step: str, sample: Optional[str] = None) -> None:
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    with log_path.open("w", encoding="utf-8") as log:
+        log.write("$ " + " ".join(cmd) + "\n\n")
+        proc = subprocess.run(cmd, stdout=log, stderr=subprocess.STDOUT)
+    if proc.returncode != 0:
+        raise PipelineError(f"Command failed ({proc.returncode}): {' '.join(cmd)}", step=step, sample=sample)
+
+
+def check_tools(tools: List[str]) -> None:
+    missing = [t for t in tools if shutil.which(t) is None]
+    if missing:
+        raise PipelineError(f"Missing required tools in PATH: {', '.join(missing)}", step="tool_check")
+
+
+def resolve_reference_dir(reference_root: Path, genome: Optional[str]) -> Path:
+    if genome is None:
+        return reference_root
+    reference_dir = reference_root / genome
+    if not reference_dir.is_dir():
+        raise PipelineError(f"Genome-specific reference directory not found: {reference_dir}", step="reference_check")
+    return reference_dir
+
+
+def validate_reference(reference_dir: Path) -> Dict[str, Path]:
+    star_index = reference_dir / "star_index"
+    annotation_gtf = reference_dir / "annotation.gtf"
+    featurecounts_gtf = reference_dir / "featurecounts.gtf"
+    rsem_prefix = reference_dir / "rsem_reference"
+
+    missing = []
+    if not star_index.is_dir():
+        missing.append(str(star_index))
+    if not annotation_gtf.is_file():
+        missing.append(str(annotation_gtf))
+    if not featurecounts_gtf.is_file():
+        missing.append(str(featurecounts_gtf))
+    if not (rsem_prefix.with_suffix(".grp").exists() and rsem_prefix.with_suffix(".ti").exists()):
+        missing.append(f"{rsem_prefix}(.grp/.ti)")
+
+    if missing:
+        raise PipelineError("Reference directory is missing required files: " + ", ".join(missing), step="reference_check")
+
+    return {
+        "star_index": star_index,
+        "annotation_gtf": annotation_gtf,
+        "featurecounts_gtf": featurecounts_gtf,
+        "rsem_prefix": rsem_prefix,
+    }
+
+
+def detect_samples(workdir: Path) -> List[Tuple[str, Path, Path]]:
+    fastq_dir = workdir / "fastq"
+    if not fastq_dir.is_dir():
+        raise PipelineError("workdir/fastq directory does not exist", step="sample_detection")
+
+    r1_files = sorted(fastq_dir.glob("*_R1.fastq.gz"))
+    if not r1_files:
+        raise PipelineError("No paired FASTQ files found in fastq/", step="sample_detection")
+
+    samples: Dict[str, Tuple[Path, Path]] = {}
+    pattern = re.compile(r"^(?P<sample>.+)_R1\.fastq\.gz$")
+
+    for r1 in r1_files:
+        m = pattern.match(r1.name)
+        if not m:
+            continue
+        sample_id = m.group("sample")
+        if not sample_id:
+            raise PipelineError(f"Invalid sample id from filename: {r1.name}", step="sample_detection")
+        if sample_id in samples:
+            raise PipelineError(f"Conflicting sample interpretation for sample_id={sample_id}", step="sample_detection", sample=sample_id)
+        r2 = fastq_dir / f"{sample_id}_R2.fastq.gz"
+        if not r2.exists():
+            raise PipelineError(f"Missing R2 FASTQ for sample {sample_id}: {r2}", step="sample_detection", sample=sample_id)
+        samples[sample_id] = (r1, r2)
+
+    if not samples:
+        raise PipelineError("No valid sample pairs detected", step="sample_detection")
+
+    for r2 in fastq_dir.glob("*_R2.fastq.gz"):
+        candidate = r2.name[: -len("_R2.fastq.gz")]
+        if candidate not in samples:
+            raise PipelineError(f"Orphan R2 FASTQ without matching R1: {r2.name}", step="sample_detection", sample=candidate)
+
+    sample_list = sorted((sample, pair[0], pair[1]) for sample, pair in samples.items())
+    samples_tsv = workdir / "samples.tsv"
+    with samples_tsv.open("w", encoding="utf-8", newline="") as f:
+        w = csv.writer(f, delimiter="\t")
+        w.writerow(["sample_id", "r1", "r2"])
+        for sample_id, r1, r2 in sample_list:
+            w.writerow([sample_id, str(r1.relative_to(workdir)), str(r2.relative_to(workdir))])
+
+    return sample_list
+
+
+def write_params(workdir: Path, args: argparse.Namespace) -> None:
+    out = workdir / "logs" / "run_parameters.txt"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    with out.open("w", encoding="utf-8") as f:
+        for k, v in vars(args).items():
+            f.write(f"{k}: {v}\n")
+
+
+def capture_versions(workdir: Path) -> None:
+    out = workdir / "metadata" / "versions.txt"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    with out.open("w", encoding="utf-8") as f:
+        f.write(f"pipeline_version: git:{git_commit()}\n")
+        f.write(f"datetime: {now_iso()}\n")
+        f.write(f"hostname: {socket.gethostname()}\n")
+
+        module_list = subprocess.run(["bash", "-lc", "module list 2>&1 || true"], capture_output=True, text=True)
+        f.write("module_list:\n")
+        f.write(module_list.stdout.strip() + "\n\n")
+
+        version_cmds = {
+            "fastqc": ["fastqc", "--version"],
+            "cutadapt": ["cutadapt", "--version"],
+            "STAR": ["STAR", "--version"],
+            "samtools": ["samtools", "--version"],
+            "featureCounts": ["featureCounts", "-v"],
+            "rsem-calculate-expression": ["rsem-calculate-expression", "--version"],
+            "multiqc": ["multiqc", "--version"],
+        }
+        for name, cmd in version_cmds.items():
+            p = subprocess.run(cmd, capture_output=True, text=True)
+            txt = (p.stdout or p.stderr).strip().splitlines()
+            ver = txt[0] if txt else "unknown"
+            f.write(f"{name}: {ver}\n")
+
+
+def git_commit() -> str:
+    p = subprocess.run(["git", "rev-parse", "--short", "HEAD"], capture_output=True, text=True)
+    return p.stdout.strip() if p.returncode == 0 else "unknown"
+
+
+def stranded_featurecounts_mode(stranded: str) -> str:
+    return {"none": "0", "forward": "1", "reverse": "2"}[stranded]
+
+
+def aggregate_featurecounts(sample_outputs: Dict[str, Path], out_tsv: Path) -> None:
+    matrices: Dict[str, Dict[str, str]] = {}
+    sample_order = sorted(sample_outputs)
+
+    for sample in sample_order:
+        out_file = sample_outputs[sample]
+        with out_file.open("r", encoding="utf-8") as f:
+            rows = [line for line in f if not line.startswith("#")]
+        reader = csv.DictReader(rows, delimiter="\t")
+        for row in reader:
+            gid = row["Geneid"]
+            count = row[next(reversed(row))]
+            matrices.setdefault(gid, {})[sample] = count
+
+    out_tsv.parent.mkdir(parents=True, exist_ok=True)
+    with out_tsv.open("w", encoding="utf-8", newline="") as f:
+        w = csv.writer(f, delimiter="\t")
+        w.writerow(["gene_id", *sample_order])
+        for gid in sorted(matrices):
+            w.writerow([gid, *[matrices[gid].get(s, "0") for s in sample_order]])
+
+
+def aggregate_rsem(sample_gene_results: Dict[str, Path], out_expected: Path, out_tpm: Path) -> None:
+    sample_order = sorted(sample_gene_results)
+    exp: Dict[str, Dict[str, str]] = {}
+    tpm: Dict[str, Dict[str, str]] = {}
+
+    for sample in sample_order:
+        path = sample_gene_results[sample]
+        with path.open("r", encoding="utf-8") as f:
+            reader = csv.DictReader(f, delimiter="\t")
+            for row in reader:
+                gid = row["gene_id"]
+                exp.setdefault(gid, {})[sample] = row["expected_count"]
+                tpm.setdefault(gid, {})[sample] = row["TPM"]
+
+    for out_file, matrix in [(out_expected, exp), (out_tpm, tpm)]:
+        out_file.parent.mkdir(parents=True, exist_ok=True)
+        with out_file.open("w", encoding="utf-8", newline="") as f:
+            w = csv.writer(f, delimiter="\t")
+            w.writerow(["gene_id", *sample_order])
+            for gid in sorted(matrix):
+                w.writerow([gid, *[matrix[gid].get(s, "0") for s in sample_order]])
+
+
+def write_summary(
+    workdir: Path,
+    status: str,
+    started: str,
+    finished: str,
+    sample_count: int,
+    completed_count: int,
+    failed_count: int,
+) -> None:
+    status_dir = workdir / "status"
+    out = status_dir / "summary.txt"
+    with out.open("w", encoding="utf-8") as f:
+        f.write(f"Pipeline status: {status}\n")
+        f.write(f"Started: {started}\n")
+        f.write(f"Finished: {finished}\n")
+        f.write(f"Samples detected: {sample_count}\n")
+        f.write(f"Samples completed: {completed_count}\n")
+        f.write(f"Failed samples: {failed_count}\n")
+        f.write("Main outputs:\n")
+        f.write("- counts/gene_integer_counts.tsv\n")
+        f.write("- abundance/gene_expected_counts.tsv\n")
+        f.write("- abundance/gene_tpm.tsv\n")
+        f.write("- multiqc/multiqc_report.html\n")
+
+
+def ensure_dirs(workdir: Path) -> None:
+    required = [
+        "trimmed",
+        "align/star/firstpass",
+        "align/star/secondpass",
+        "align/bam",
+        "qc/fastqc_raw",
+        "qc/fastqc_trimmed",
+        "qc/star",
+        "qc/samtools",
+        "qc/featurecounts",
+        "qc/cutadapt",
+        "counts",
+        "abundance",
+        "multiqc",
+        "logs",
+        "logs/steps",
+        "status",
+        "metadata",
+    ]
+    for d in required:
+        (workdir / d).mkdir(parents=True, exist_ok=True)
+
+
+def process_sample(
+    workdir: Path,
+    sample: str,
+    refs: Dict[str, Path],
+    threads: int,
+    stranded: str,
+    all_sj_files: List[Path],
+) -> Tuple[Path, Path]:
+    secondpass_prefix = workdir / "align/star/secondpass" / f"{sample}."
+    trimmed_r1 = workdir / "trimmed" / f"{sample}_R1.trim.fastq.gz"
+    trimmed_r2 = workdir / "trimmed" / f"{sample}_R2.trim.fastq.gz"
+
+    run_cmd(
+        [
+            "STAR",
+            "--runThreadN", str(threads),
+            "--genomeDir", str(refs["star_index"]),
+            "--readFilesIn", str(trimmed_r1), str(trimmed_r2),
+            "--readFilesCommand", "zcat",
+            "--sjdbFileChrStartEnd", *[str(p) for p in all_sj_files],
+            "--outSAMtype", "BAM", "SortedByCoordinate",
+            "--outFileNamePrefix", str(secondpass_prefix),
+        ],
+        workdir / "logs/steps" / f"{sample}.star_secondpass.log",
+        step="star_secondpass",
+        sample=sample,
+    )
+
+    star_bam = workdir / "align/star/secondpass" / f"{sample}.Aligned.sortedByCoord.out.bam"
+    bam_out = workdir / "align/bam" / f"{sample}.bam"
+    shutil.copy2(star_bam, bam_out)
+    run_cmd(
+        ["samtools", "index", str(bam_out)],
+        workdir / "logs/steps" / f"{sample}.samtools_index.log",
+        step="samtools_index",
+        sample=sample,
+    )
+
+    log_final = workdir / "align/star/secondpass" / f"{sample}.Log.final.out"
+    shutil.copy2(log_final, workdir / "qc/star" / f"{sample}.Log.final.out")
+
+    run_cmd(
+        ["samtools", "flagstat", str(bam_out)],
+        workdir / "qc/samtools" / f"{sample}.flagstat.txt",
+        step="samtools_flagstat",
+        sample=sample,
+    )
+    run_cmd(
+        ["samtools", "stats", str(bam_out)],
+        workdir / "qc/samtools" / f"{sample}.stats.txt",
+        step="samtools_stats",
+        sample=sample,
+    )
+
+    fc_out = workdir / "qc/featurecounts" / f"{sample}.featureCounts.txt"
+    run_cmd(
+        [
+            "featureCounts",
+            "-T", str(threads),
+            "-p",
+            "-B",
+            "-C",
+            "-s", stranded_featurecounts_mode(stranded),
+            "-a", str(refs["featurecounts_gtf"]),
+            "-o", str(fc_out),
+            str(bam_out),
+        ],
+        workdir / "logs/steps" / f"{sample}.featurecounts.log",
+        step="featurecounts",
+        sample=sample,
+    )
+
+    rsem_prefix = workdir / "abundance" / sample
+    run_cmd(
+        [
+            "rsem-calculate-expression",
+            "--alignments",
+            "--paired-end",
+            "--strandedness", stranded,
+            "--num-threads", str(threads),
+            str(bam_out),
+            str(refs["rsem_prefix"]),
+            str(rsem_prefix),
+        ],
+        workdir / "logs/steps" / f"{sample}.rsem.log",
+        step="rsem",
+        sample=sample,
+    )
+
+    rsem_gene_results = workdir / "abundance" / f"{sample}.genes.results"
+    if not rsem_gene_results.exists():
+        raise PipelineError(f"Missing RSEM gene result for sample {sample}", step="rsem", sample=sample)
+
+    return fc_out, rsem_gene_results
+
+
+def run_star_first_pass(workdir: Path, samples: List[Tuple[str, Path, Path]], refs: Dict[str, Path], threads: int) -> List[Path]:
+    sj_files: List[Path] = []
+    for sample, _, _ in samples:
+        trimmed_r1 = workdir / "trimmed" / f"{sample}_R1.trim.fastq.gz"
+        trimmed_r2 = workdir / "trimmed" / f"{sample}_R2.trim.fastq.gz"
+        out_prefix = workdir / "align/star/firstpass" / f"{sample}."
+        run_cmd(
+            [
+                "STAR",
+                "--runThreadN", str(threads),
+                "--genomeDir", str(refs["star_index"]),
+                "--readFilesIn", str(trimmed_r1), str(trimmed_r2),
+                "--readFilesCommand", "zcat",
+                "--outSAMtype", "None",
+                "--outFileNamePrefix", str(out_prefix),
+            ],
+            workdir / "logs/steps" / f"{sample}.star_firstpass.log",
+            step="star_firstpass",
+            sample=sample,
+        )
+        sj = workdir / "align/star/firstpass" / f"{sample}.SJ.out.tab"
+        if not sj.exists():
+            raise PipelineError(f"Missing STAR SJ.out.tab in first pass for sample {sample}", step="star_firstpass", sample=sample)
+        sj_files.append(sj)
+    return sj_files
+
+
+def execute(args: argparse.Namespace) -> int:
+    workdir = Path(args.workdir).resolve()
+    reference_root = Path(args.reference).resolve()
+    workdir.mkdir(parents=True, exist_ok=True)
+    ensure_dirs(workdir)
+
+    status_dir = workdir / "status"
+    running = status_dir / "RUNNING"
+    running.write_text(now_iso() + "\n", encoding="utf-8")
+    started = now_iso()
+
+    completed_samples = 0
+    samples: List[Tuple[str, Path, Path]] = []
+
+    try:
+        check_tools(["fastqc", "cutadapt", "STAR", "samtools", "featureCounts", "rsem-calculate-expression", "multiqc"])
+        reference_dir = resolve_reference_dir(reference_root, args.genome)
+        refs = validate_reference(reference_dir)
+        samples = detect_samples(workdir)
+        write_params(workdir, args)
+        capture_versions(workdir)
+
+        first_pass_inputs = []
+        for sample, r1, r2 in samples:
+            trimmed_r1 = workdir / "trimmed" / f"{sample}_R1.trim.fastq.gz"
+            trimmed_r2 = workdir / "trimmed" / f"{sample}_R2.trim.fastq.gz"
+            run_cmd(
+                ["fastqc", "-t", str(max(1, args.threads // 2)), "-o", str(workdir / "qc/fastqc_raw"), str(r1), str(r2)],
+                workdir / "logs/steps" / f"{sample}.fastqc_raw.log",
+                step="fastqc_raw",
+                sample=sample,
+            )
+            run_cmd(
+                [
+                    "cutadapt",
+                    "-j", str(max(1, args.threads // 2)),
+                    "-o", str(trimmed_r1),
+                    "-p", str(trimmed_r2),
+                    "--json", str(workdir / "qc/cutadapt" / f"{sample}.cutadapt.json"),
+                    str(r1),
+                    str(r2),
+                ],
+                workdir / "logs/steps" / f"{sample}.cutadapt.log",
+                step="cutadapt",
+                sample=sample,
+            )
+            run_cmd(
+                ["fastqc", "-t", str(max(1, args.threads // 2)), "-o", str(workdir / "qc/fastqc_trimmed"), str(trimmed_r1), str(trimmed_r2)],
+                workdir / "logs/steps" / f"{sample}.fastqc_trimmed.log",
+                step="fastqc_trimmed",
+                sample=sample,
+            )
+            first_pass_inputs.append((sample, r1, r2))
+
+        sj_files = run_star_first_pass(workdir, first_pass_inputs, refs, args.threads)
+
+        fc_map: Dict[str, Path] = {}
+        rsem_map: Dict[str, Path] = {}
+        for sample, _, _ in samples:
+            fc_out, rsem_gene = process_sample(workdir, sample, refs, args.threads, args.stranded, sj_files)
+            fc_map[sample] = fc_out
+            rsem_map[sample] = rsem_gene
+            completed_samples += 1
+
+        aggregate_featurecounts(fc_map, workdir / "counts/gene_integer_counts.tsv")
+        aggregate_rsem(
+            rsem_map,
+            workdir / "abundance/gene_expected_counts.tsv",
+            workdir / "abundance/gene_tpm.tsv",
+        )
+
+        run_cmd(
+            ["multiqc", str(workdir), "-o", str(workdir / "multiqc")],
+            workdir / "logs/steps" / "multiqc.log",
+            step="multiqc",
+            sample=None,
+        )
+
+        required_outputs = [
+            workdir / "counts/gene_integer_counts.tsv",
+            workdir / "abundance/gene_expected_counts.tsv",
+            workdir / "abundance/gene_tpm.tsv",
+            workdir / "multiqc/multiqc_report.html",
+        ]
+        for path in required_outputs:
+            if not path.exists():
+                raise PipelineError(f"Required output missing: {path}", step="final_validation")
+
+        (status_dir / "SUCCESS").write_text(now_iso() + "\n", encoding="utf-8")
+        (status_dir / "finished_at.txt").write_text(now_iso() + "\n", encoding="utf-8")
+        if running.exists():
+            running.unlink()
+
+        write_summary(
+            workdir,
+            "SUCCESS",
+            started,
+            now_iso(),
+            len(samples),
+            completed_samples,
+            0,
+        )
+        return 0
+
+    except PipelineError as e:
+        (status_dir / "FAILED").write_text(now_iso() + "\n", encoding="utf-8")
+        (status_dir / "failed_step.txt").write_text(e.step + "\n", encoding="utf-8")
+        if e.sample is not None:
+            (status_dir / "failed_sample.txt").write_text(e.sample + "\n", encoding="utf-8")
+
+        if running.exists():
+            running.unlink()
+
+        write_summary(
+            workdir,
+            "FAILED",
+            started,
+            now_iso(),
+            len(samples),
+            completed_samples,
+            max(0, len(samples) - completed_samples),
+        )
+        print(f"ERROR: {e}", file=sys.stderr)
+        return 1
+
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="RNA-seq MVP pipeline runner")
+    p.add_argument("workdir", help="Working directory containing fastq/")
+    p.add_argument("--reference", required=True, help="Reference root directory")
+    p.add_argument("--genome", required=False, help="Genome key under reference root (optional)")
+    p.add_argument("--stranded", required=True, choices=["none", "forward", "reverse"], help="Library strandedness")
+    p.add_argument("--threads", required=True, type=int, help="Total threads")
+    return p.parse_args()
+
+
+if __name__ == "__main__":
+    args = parse_args()
+    if args.threads < 1:
+        print("--threads must be >= 1", file=sys.stderr)
+        sys.exit(2)
+    sys.exit(execute(args))
