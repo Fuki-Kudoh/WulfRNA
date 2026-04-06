@@ -1,0 +1,2 @@
+# WulfRNA
+Bulk RNAseq pipeline
