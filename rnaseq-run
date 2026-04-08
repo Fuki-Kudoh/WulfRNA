@@ -181,15 +181,26 @@ def stranded_featurecounts_mode(stranded: str) -> str:
 def aggregate_featurecounts(sample_outputs: Dict[str, Path], out_tsv: Path) -> None:
     matrices: Dict[str, Dict[str, str]] = {}
     sample_order = sorted(sample_outputs)
+    metadata_columns = {"Geneid", "Chr", "Start", "End", "Strand", "Length"}
 
     for sample in sample_order:
         out_file = sample_outputs[sample]
         with out_file.open("r", encoding="utf-8") as f:
             rows = [line for line in f if not line.startswith("#")]
         reader = csv.DictReader(rows, delimiter="\t")
+        if reader.fieldnames is None:
+            raise PipelineError(f"Missing featureCounts header in {out_file}", step="featurecounts_aggregate", sample=sample)
+        count_columns = [c for c in reader.fieldnames if c not in metadata_columns]
+        if len(count_columns) != 1:
+            raise PipelineError(
+                f"Expected one featureCounts count column for {sample}, found {len(count_columns)} in {out_file}",
+                step="featurecounts_aggregate",
+                sample=sample,
+            )
+        count_column = count_columns[0]
         for row in reader:
             gid = row["Geneid"]
-            count = row[next(reversed(row))]
+            count = row[count_column]
             matrices.setdefault(gid, {})[sample] = count
 
     out_tsv.parent.mkdir(parents=True, exist_ok=True)
@@ -422,13 +433,13 @@ def execute(args: argparse.Namespace) -> int:
         capture_versions(workdir, dry_run=args.dry_run)
 
         if args.dry_run:
-            (status_dir / "SUCCESS").write_text(now_iso() + "\n", encoding="utf-8")
+            (status_dir / "DRY_RUN_OK").write_text(now_iso() + "\n", encoding="utf-8")
             (status_dir / "finished_at.txt").write_text(now_iso() + "\n", encoding="utf-8")
             if running.exists():
                 running.unlink()
             write_summary(
                 workdir,
-                "SUCCESS",
+                "DRY_RUN_OK",
                 started,
                 now_iso(),
                 len(samples),
