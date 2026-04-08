@@ -136,13 +136,18 @@ python3 -m venv .venv
 source .venv/bin/activate
 ```
 
-If the repository is packaged as a Python project, install it with:
+Install the package in editable mode:
 
 ```bash
 pip install -e .
 ```
 
-If the repository is not yet packaged, use the development entrypoint described below.
+This installs the `wulfrna` command.
+You can also run the CLI module directly:
+
+```bash
+python -m wulfrna.cli run /path/to/workdir --reference /path/to/reference_dir --stranded reverse --threads 16
+```
 
 ---
 
