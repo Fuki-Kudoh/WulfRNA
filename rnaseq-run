@@ -246,6 +246,7 @@ def ensure_dirs(workdir: Path) -> None:
         "qc/featurecounts",
         "qc/cutadapt",
         "counts",
+        "counts/featurecounts",
         "abundance",
         "multiqc",
         "logs",
@@ -266,8 +267,8 @@ def process_sample(
     all_sj_files: List[Path],
 ) -> Tuple[Path, Path]:
     secondpass_prefix = workdir / "align/star/secondpass" / f"{sample}."
-    trimmed_r1 = workdir / "trimmed" / f"{sample}_R1.trim.fastq.gz"
-    trimmed_r2 = workdir / "trimmed" / f"{sample}_R2.trim.fastq.gz"
+    trimmed_r1 = workdir / "trimmed" / f"{sample}_R1.trimmed.fastq.gz"
+    trimmed_r2 = workdir / "trimmed" / f"{sample}_R2.trimmed.fastq.gz"
 
     run_cmd(
         [
@@ -286,7 +287,7 @@ def process_sample(
     )
 
     star_bam = workdir / "align/star/secondpass" / f"{sample}.Aligned.sortedByCoord.out.bam"
-    bam_out = workdir / "align/bam" / f"{sample}.bam"
+    bam_out = workdir / "align/bam" / f"{sample}.sorted.bam"
     shutil.copy2(star_bam, bam_out)
     run_cmd(
         ["samtools", "index", str(bam_out)],
@@ -311,7 +312,7 @@ def process_sample(
         sample=sample,
     )
 
-    fc_out = workdir / "qc/featurecounts" / f"{sample}.featureCounts.txt"
+    fc_out = workdir / "counts/featurecounts" / f"{sample}.featureCounts.txt"
     run_cmd(
         [
             "featureCounts",
@@ -328,6 +329,9 @@ def process_sample(
         step="featurecounts",
         sample=sample,
     )
+    fc_summary = fc_out.with_name(fc_out.name + ".summary")
+    if fc_summary.exists():
+        shutil.copy2(fc_summary, workdir / "qc/featurecounts" / fc_summary.name)
 
     rsem_prefix = workdir / "abundance" / sample
     run_cmd(
@@ -356,8 +360,8 @@ def process_sample(
 def run_star_first_pass(workdir: Path, samples: List[Tuple[str, Path, Path]], refs: Dict[str, Path], threads: int) -> List[Path]:
     sj_files: List[Path] = []
     for sample, _, _ in samples:
-        trimmed_r1 = workdir / "trimmed" / f"{sample}_R1.trim.fastq.gz"
-        trimmed_r2 = workdir / "trimmed" / f"{sample}_R2.trim.fastq.gz"
+        trimmed_r1 = workdir / "trimmed" / f"{sample}_R1.trimmed.fastq.gz"
+        trimmed_r2 = workdir / "trimmed" / f"{sample}_R2.trimmed.fastq.gz"
         out_prefix = workdir / "align/star/firstpass" / f"{sample}."
         run_cmd(
             [
@@ -402,10 +406,26 @@ def execute(args: argparse.Namespace) -> int:
         write_params(workdir, args)
         capture_versions(workdir)
 
+        if args.dry_run:
+            (status_dir / "SUCCESS").write_text(now_iso() + "\n", encoding="utf-8")
+            (status_dir / "finished_at.txt").write_text(now_iso() + "\n", encoding="utf-8")
+            if running.exists():
+                running.unlink()
+            write_summary(
+                workdir,
+                "SUCCESS",
+                started,
+                now_iso(),
+                len(samples),
+                0,
+                0,
+            )
+            return 0
+
         first_pass_inputs = []
         for sample, r1, r2 in samples:
-            trimmed_r1 = workdir / "trimmed" / f"{sample}_R1.trim.fastq.gz"
-            trimmed_r2 = workdir / "trimmed" / f"{sample}_R2.trim.fastq.gz"
+            trimmed_r1 = workdir / "trimmed" / f"{sample}_R1.trimmed.fastq.gz"
+            trimmed_r2 = workdir / "trimmed" / f"{sample}_R2.trimmed.fastq.gz"
             run_cmd(
                 ["fastqc", "-t", str(max(1, args.threads // 2)), "-o", str(workdir / "qc/fastqc_raw"), str(r1), str(r2)],
                 workdir / "logs/steps" / f"{sample}.fastqc_raw.log",
@@ -513,6 +533,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--genome", required=False, help="Genome key under reference root (optional)")
     p.add_argument("--stranded", required=True, choices=["none", "forward", "reverse"], help="Library strandedness")
     p.add_argument("--threads", required=True, type=int, help="Total threads")
+    p.add_argument("--dry-run", action="store_true", help="Validate inputs, write metadata, and exit without running analysis tools")
     return p.parse_args()
 
 
