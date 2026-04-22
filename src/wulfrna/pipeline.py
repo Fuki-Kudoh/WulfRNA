@@ -6,6 +6,7 @@ import re
 import shutil
 import subprocess
 import sys
+from collections import defaultdict
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -43,31 +44,31 @@ def resolve_reference_dir(reference_root: Path, genome: Optional[str]) -> Path:
     return reference_dir
 
 
-def validate_reference(reference_dir: Path) -> Dict[str, Path]:
-    star_index = reference_dir / "star_index"
-    annotation_gtf = reference_dir / "annotation.gtf"
-    featurecounts_gtf = reference_dir / "featurecounts.gtf"
-    rsem_prefix = reference_dir / "rsem_reference"
+def validate_reference(reference_dir: Path, quantifier: str) -> Dict[str, Path]:
+    tx2gene = reference_dir / "combined_tx2gene.tsv"
+    missing: List[str] = []
 
-    missing = []
-    if not star_index.is_dir():
-        missing.append(str(star_index))
-    if not annotation_gtf.is_file():
-        missing.append(str(annotation_gtf))
-    if not featurecounts_gtf.is_file():
-        missing.append(str(featurecounts_gtf))
-    if not (rsem_prefix.with_suffix(".grp").exists() and rsem_prefix.with_suffix(".ti").exists()):
-        missing.append(f"{rsem_prefix}(.grp/.ti)")
+    refs: Dict[str, Path] = {"tx2gene": tx2gene}
+    if quantifier == "salmon":
+        salmon_index = reference_dir / "salmon_index"
+        refs["index"] = salmon_index
+        if not salmon_index.is_dir():
+            missing.append(str(salmon_index))
+    elif quantifier == "kallisto":
+        kallisto_index = reference_dir / "kallisto_index" / "combined_transcripts.kidx"
+        refs["index"] = kallisto_index
+        if not kallisto_index.is_file():
+            missing.append(str(kallisto_index))
+    else:
+        raise PipelineError(f"Unsupported quantifier: {quantifier}", step="reference_check")
+
+    if not tx2gene.is_file():
+        missing.append(str(tx2gene))
 
     if missing:
         raise PipelineError("Reference directory is missing required files: " + ", ".join(missing), step="reference_check")
 
-    return {
-        "star_index": star_index,
-        "annotation_gtf": annotation_gtf,
-        "featurecounts_gtf": featurecounts_gtf,
-        "rsem_prefix": rsem_prefix,
-    }
+    return refs
 
 
 def detect_samples(workdir: Path) -> List[Tuple[str, Path, Path]]:
@@ -127,77 +128,163 @@ def capture_versions(workdir: Path) -> None:
     capture_versions_file(workdir / "metadata" / "versions.txt")
 
 
-def stranded_featurecounts_mode(stranded: str) -> str:
-    return {"none": "0", "forward": "1", "reverse": "2"}[stranded]
+def parse_tx2gene(tx2gene_tsv: Path) -> Dict[str, str]:
+    mapping: Dict[str, str] = {}
+    with tx2gene_tsv.open("r", encoding="utf-8") as f:
+        reader = csv.reader(f, delimiter="\t")
+        header = next(reader, None)
+        if header is None:
+            raise PipelineError(f"Empty tx2gene file: {tx2gene_tsv}", step="tx2gene")
+
+        tx_idx = 0
+        gene_idx = 1
+        lower_header = [h.strip().lower() for h in header]
+        if "transcript_id" in lower_header and "gene_id" in lower_header:
+            tx_idx = lower_header.index("transcript_id")
+            gene_idx = lower_header.index("gene_id")
+
+        for row_num, row in enumerate(reader, start=2):
+            if len(row) <= max(tx_idx, gene_idx):
+                raise PipelineError(f"Malformed tx2gene row {row_num} in {tx2gene_tsv}", step="tx2gene")
+            tx_id = row[tx_idx].strip()
+            gene_id = row[gene_idx].strip()
+            if not tx_id or not gene_id:
+                raise PipelineError(f"Blank transcript or gene ID at row {row_num} in {tx2gene_tsv}", step="tx2gene")
+            mapping[tx_id] = gene_id
+
+    if not mapping:
+        raise PipelineError(f"No mappings found in {tx2gene_tsv}", step="tx2gene")
+    return mapping
 
 
-def aggregate_featurecounts(sample_outputs: Dict[str, Path], out_tsv: Path) -> None:
-    matrices: Dict[str, Dict[str, str]] = {}
-    sample_order = sorted(sample_outputs)
-    metadata_columns = {"Geneid", "Chr", "Start", "End", "Strand", "Length"}
+def run_salmon_quant(workdir: Path, sample: str, refs: Dict[str, Path], threads: int) -> Path:
+    trimmed_r1 = workdir / "trimmed" / f"{sample}_R1.trimmed.fastq.gz"
+    trimmed_r2 = workdir / "trimmed" / f"{sample}_R2.trimmed.fastq.gz"
+    sample_dir = workdir / "abundance" / "salmon" / sample
+    run_cmd(
+        [
+            "salmon",
+            "quant",
+            "-i",
+            str(refs["index"]),
+            "-l",
+            "A",
+            "--validateMappings",
+            "--seqBias",
+            "--gcBias",
+            "-1",
+            str(trimmed_r1),
+            "-2",
+            str(trimmed_r2),
+            "-p",
+            str(threads),
+            "-o",
+            str(sample_dir),
+        ],
+        workdir / "logs/steps" / f"{sample}.salmon.log",
+        step="salmon_quant",
+        sample=sample,
+    )
+    quant_sf = sample_dir / "quant.sf"
+    if not quant_sf.exists():
+        raise PipelineError(f"Missing Salmon quant file for sample {sample}: {quant_sf}", step="salmon_quant", sample=sample)
+    return quant_sf
+
+
+def run_kallisto_quant(workdir: Path, sample: str, refs: Dict[str, Path], threads: int) -> Path:
+    trimmed_r1 = workdir / "trimmed" / f"{sample}_R1.trimmed.fastq.gz"
+    trimmed_r2 = workdir / "trimmed" / f"{sample}_R2.trimmed.fastq.gz"
+    sample_dir = workdir / "abundance" / "kallisto" / sample
+    run_cmd(
+        [
+            "kallisto",
+            "quant",
+            "-i",
+            str(refs["index"]),
+            "-t",
+            str(threads),
+            "-o",
+            str(sample_dir),
+            str(trimmed_r1),
+            str(trimmed_r2),
+        ],
+        workdir / "logs/steps" / f"{sample}.kallisto.log",
+        step="kallisto_quant",
+        sample=sample,
+    )
+    abundance_tsv = sample_dir / "abundance.tsv"
+    if not abundance_tsv.exists():
+        raise PipelineError(
+            f"Missing kallisto abundance file for sample {sample}: {abundance_tsv}",
+            step="kallisto_quant",
+            sample=sample,
+        )
+    return abundance_tsv
+
+
+def aggregate_transcript_quant(
+    sample_quant_files: Dict[str, Path],
+    tx2gene_map: Dict[str, str],
+    quantifier: str,
+    out_expected: Path,
+    out_tpm: Path,
+) -> None:
+    sample_order = sorted(sample_quant_files)
+    expected_by_gene: Dict[str, Dict[str, float]] = defaultdict(dict)
+    tpm_by_gene: Dict[str, Dict[str, float]] = defaultdict(dict)
+
+    if quantifier == "salmon":
+        tx_col, exp_col, tpm_col = "Name", "NumReads", "TPM"
+        step = "aggregate_salmon"
+    elif quantifier == "kallisto":
+        tx_col, exp_col, tpm_col = "target_id", "est_counts", "tpm"
+        step = "aggregate_kallisto"
+    else:
+        raise PipelineError(f"Unsupported quantifier for aggregation: {quantifier}", step="aggregate")
 
     for sample in sample_order:
-        out_file = sample_outputs[sample]
-        with out_file.open("r", encoding="utf-8") as f:
-            rows = [line for line in f if not line.startswith("#")]
-        reader = csv.DictReader(rows, delimiter="\t")
-        if reader.fieldnames is None:
-            raise PipelineError(f"featureCounts output is missing a header: {out_file}", step="aggregate_featurecounts", sample=sample)
+        sample_exp: Dict[str, float] = defaultdict(float)
+        sample_tpm: Dict[str, float] = defaultdict(float)
 
-        count_columns = [col for col in reader.fieldnames if col not in metadata_columns]
-        if not count_columns:
-            raise PipelineError(
-                f"featureCounts output has no count column: {out_file}",
-                step="aggregate_featurecounts",
-                sample=sample,
-            )
-        if len(count_columns) == 1:
-            count_column = count_columns[0]
-        else:
-            expected_suffix = f"/{sample}.sorted.bam"
-            matching = sorted(col for col in count_columns if col.endswith(expected_suffix))
-            if len(matching) != 1:
-                raise PipelineError(
-                    f"featureCounts output has ambiguous count columns for sample {sample}: {', '.join(count_columns)}",
-                    step="aggregate_featurecounts",
-                    sample=sample,
-                )
-            count_column = matching[0]
-
-        for row in reader:
-            gid = row["Geneid"]
-            count = row[count_column]
-            matrices.setdefault(gid, {})[sample] = count
-
-    out_tsv.parent.mkdir(parents=True, exist_ok=True)
-    with out_tsv.open("w", encoding="utf-8", newline="") as f:
-        w = csv.writer(f, delimiter="\t")
-        w.writerow(["gene_id", *sample_order])
-        for gid in sorted(matrices):
-            w.writerow([gid, *[matrices[gid].get(s, "0") for s in sample_order]])
-
-
-def aggregate_rsem(sample_gene_results: Dict[str, Path], out_expected: Path, out_tpm: Path) -> None:
-    sample_order = sorted(sample_gene_results)
-    exp: Dict[str, Dict[str, str]] = {}
-    tpm: Dict[str, Dict[str, str]] = {}
-
-    for sample in sample_order:
-        path = sample_gene_results[sample]
+        path = sample_quant_files[sample]
         with path.open("r", encoding="utf-8") as f:
             reader = csv.DictReader(f, delimiter="\t")
-            for row in reader:
-                gid = row["gene_id"]
-                exp.setdefault(gid, {})[sample] = row["expected_count"]
-                tpm.setdefault(gid, {})[sample] = row["TPM"]
+            if reader.fieldnames is None:
+                raise PipelineError(f"Quantification file is missing header: {path}", step=step, sample=sample)
 
-    for out_file, matrix in [(out_expected, exp), (out_tpm, tpm)]:
-        out_file.parent.mkdir(parents=True, exist_ok=True)
-        with out_file.open("w", encoding="utf-8", newline="") as f:
-            w = csv.writer(f, delimiter="\t")
-            w.writerow(["gene_id", *sample_order])
-            for gid in sorted(matrix):
-                w.writerow([gid, *[matrix[gid].get(s, "0") for s in sample_order]])
+            required_cols = {tx_col, exp_col, tpm_col}
+            if not required_cols.issubset(set(reader.fieldnames)):
+                raise PipelineError(
+                    f"Quantification file missing required columns ({', '.join(sorted(required_cols))}): {path}",
+                    step=step,
+                    sample=sample,
+                )
+
+            for row in reader:
+                tx_id = row[tx_col]
+                gene_id = tx2gene_map.get(tx_id)
+                if gene_id is None:
+                    continue
+                sample_exp[gene_id] += float(row[exp_col])
+                sample_tpm[gene_id] += float(row[tpm_col])
+
+        for gene_id, value in sample_exp.items():
+            expected_by_gene[gene_id][sample] = value
+        for gene_id, value in sample_tpm.items():
+            tpm_by_gene[gene_id][sample] = value
+
+    write_gene_matrix(out_expected, sample_order, expected_by_gene)
+    write_gene_matrix(out_tpm, sample_order, tpm_by_gene)
+
+
+def write_gene_matrix(out_file: Path, sample_order: List[str], matrix: Dict[str, Dict[str, float]]) -> None:
+    out_file.parent.mkdir(parents=True, exist_ok=True)
+    with out_file.open("w", encoding="utf-8", newline="") as f:
+        w = csv.writer(f, delimiter="\t")
+        w.writerow(["gene_id", *sample_order])
+        for gid in sorted(matrix):
+            values = [f"{matrix[gid].get(sample, 0.0):.6f}" for sample in sample_order]
+            w.writerow([gid, *values])
 
 
 def write_summary(
@@ -222,7 +309,6 @@ def write_summary(
             f.write("Expected outputs (not generated in dry-run):\n")
         else:
             f.write("Main outputs:\n")
-        f.write("- counts/gene_integer_counts.tsv\n")
         f.write("- abundance/gene_expected_counts.tsv\n")
         f.write("- abundance/gene_tpm.tsv\n")
         f.write("- multiqc/multiqc_report.html\n")
@@ -231,18 +317,12 @@ def write_summary(
 def ensure_dirs(workdir: Path) -> None:
     required = [
         "trimmed",
-        "align/star/firstpass",
-        "align/star/secondpass",
-        "align/bam",
         "qc/fastqc_raw",
         "qc/fastqc_trimmed",
-        "qc/star",
-        "qc/samtools",
-        "qc/featurecounts",
         "qc/cutadapt",
-        "counts",
-        "counts/featurecounts",
         "abundance",
+        "abundance/salmon",
+        "abundance/kallisto",
         "multiqc",
         "logs",
         "logs/steps",
@@ -251,154 +331,6 @@ def ensure_dirs(workdir: Path) -> None:
     ]
     for d in required:
         (workdir / d).mkdir(parents=True, exist_ok=True)
-
-
-def process_sample(
-    workdir: Path,
-    sample: str,
-    refs: Dict[str, Path],
-    threads: int,
-    stranded: str,
-    all_sj_files: List[Path],
-) -> Tuple[Path, Path]:
-    secondpass_prefix = workdir / "align/star/secondpass" / f"{sample}."
-    trimmed_r1 = workdir / "trimmed" / f"{sample}_R1.trimmed.fastq.gz"
-    trimmed_r2 = workdir / "trimmed" / f"{sample}_R2.trimmed.fastq.gz"
-
-    run_cmd(
-        [
-            "STAR",
-            "--runThreadN",
-            str(threads),
-            "--genomeDir",
-            str(refs["star_index"]),
-            "--readFilesIn",
-            str(trimmed_r1),
-            str(trimmed_r2),
-            "--readFilesCommand",
-            "zcat",
-            "--sjdbFileChrStartEnd",
-            *[str(p) for p in all_sj_files],
-            "--outSAMtype",
-            "BAM",
-            "SortedByCoordinate",
-            "--outFileNamePrefix",
-            str(secondpass_prefix),
-        ],
-        workdir / "logs/steps" / f"{sample}.star_secondpass.log",
-        step="star_secondpass",
-        sample=sample,
-    )
-
-    star_bam = workdir / "align/star/secondpass" / f"{sample}.Aligned.sortedByCoord.out.bam"
-    bam_out = workdir / "align/bam" / f"{sample}.sorted.bam"
-    shutil.copy2(star_bam, bam_out)
-    run_cmd(
-        ["samtools", "index", str(bam_out)],
-        workdir / "logs/steps" / f"{sample}.samtools_index.log",
-        step="samtools_index",
-        sample=sample,
-    )
-
-    log_final = workdir / "align/star/secondpass" / f"{sample}.Log.final.out"
-    shutil.copy2(log_final, workdir / "qc/star" / f"{sample}.Log.final.out")
-
-    run_cmd(
-        ["samtools", "flagstat", str(bam_out)],
-        workdir / "qc/samtools" / f"{sample}.flagstat.txt",
-        step="samtools_flagstat",
-        sample=sample,
-    )
-    run_cmd(
-        ["samtools", "stats", str(bam_out)],
-        workdir / "qc/samtools" / f"{sample}.stats.txt",
-        step="samtools_stats",
-        sample=sample,
-    )
-
-    fc_out = workdir / "counts/featurecounts" / f"{sample}.featureCounts.txt"
-    run_cmd(
-        [
-            "featureCounts",
-            "-T",
-            str(threads),
-            "-p",
-            "-B",
-            "-C",
-            "-s",
-            stranded_featurecounts_mode(stranded),
-            "-a",
-            str(refs["featurecounts_gtf"]),
-            "-o",
-            str(fc_out),
-            str(bam_out),
-        ],
-        workdir / "logs/steps" / f"{sample}.featurecounts.log",
-        step="featurecounts",
-        sample=sample,
-    )
-    fc_summary = fc_out.with_name(fc_out.name + ".summary")
-    if fc_summary.exists():
-        shutil.copy2(fc_summary, workdir / "qc/featurecounts" / fc_summary.name)
-
-    rsem_prefix = workdir / "abundance" / sample
-    run_cmd(
-        [
-            "rsem-calculate-expression",
-            "--alignments",
-            "--paired-end",
-            "--strandedness",
-            stranded,
-            "--num-threads",
-            str(threads),
-            str(bam_out),
-            str(refs["rsem_prefix"]),
-            str(rsem_prefix),
-        ],
-        workdir / "logs/steps" / f"{sample}.rsem.log",
-        step="rsem",
-        sample=sample,
-    )
-
-    rsem_gene_results = workdir / "abundance" / f"{sample}.genes.results"
-    if not rsem_gene_results.exists():
-        raise PipelineError(f"Missing RSEM gene result for sample {sample}", step="rsem", sample=sample)
-
-    return fc_out, rsem_gene_results
-
-
-def run_star_first_pass(workdir: Path, samples: List[Tuple[str, Path, Path]], refs: Dict[str, Path], threads: int) -> List[Path]:
-    sj_files: List[Path] = []
-    for sample, _, _ in samples:
-        trimmed_r1 = workdir / "trimmed" / f"{sample}_R1.trimmed.fastq.gz"
-        trimmed_r2 = workdir / "trimmed" / f"{sample}_R2.trimmed.fastq.gz"
-        out_prefix = workdir / "align/star/firstpass" / f"{sample}."
-        run_cmd(
-            [
-                "STAR",
-                "--runThreadN",
-                str(threads),
-                "--genomeDir",
-                str(refs["star_index"]),
-                "--readFilesIn",
-                str(trimmed_r1),
-                str(trimmed_r2),
-                "--readFilesCommand",
-                "zcat",
-                "--outSAMtype",
-                "None",
-                "--outFileNamePrefix",
-                str(out_prefix),
-            ],
-            workdir / "logs/steps" / f"{sample}.star_firstpass.log",
-            step="star_firstpass",
-            sample=sample,
-        )
-        sj = workdir / "align/star/firstpass" / f"{sample}.SJ.out.tab"
-        if not sj.exists():
-            raise PipelineError(f"Missing STAR SJ.out.tab in first pass for sample {sample}", step="star_firstpass", sample=sample)
-        sj_files.append(sj)
-    return sj_files
 
 
 def execute(args: argparse.Namespace) -> int:
@@ -416,9 +348,14 @@ def execute(args: argparse.Namespace) -> int:
     samples: List[Tuple[str, Path, Path]] = []
 
     try:
-        check_tools(["fastqc", "cutadapt", "STAR", "samtools", "featureCounts", "rsem-calculate-expression", "multiqc"])
+        base_tools = ["fastqc", "cutadapt", "multiqc"]
+        quant_tool = "salmon" if args.quantifier == "salmon" else "kallisto"
+        check_tools(base_tools + [quant_tool])
+
         reference_dir = resolve_reference_dir(reference_root, args.genome)
-        refs = validate_reference(reference_dir)
+        refs = validate_reference(reference_dir, args.quantifier)
+        tx2gene_map = parse_tx2gene(refs["tx2gene"])
+
         samples = detect_samples(workdir)
         write_params(workdir, args)
         capture_versions(workdir)
@@ -439,7 +376,7 @@ def execute(args: argparse.Namespace) -> int:
             )
             return 0
 
-        first_pass_inputs = []
+        quant_map: Dict[str, Path] = {}
         for sample, r1, r2 in samples:
             trimmed_r1 = workdir / "trimmed" / f"{sample}_R1.trimmed.fastq.gz"
             trimmed_r2 = workdir / "trimmed" / f"{sample}_R2.trimmed.fastq.gz"
@@ -473,21 +410,18 @@ def execute(args: argparse.Namespace) -> int:
                 step="fastqc_trimmed",
                 sample=sample,
             )
-            first_pass_inputs.append((sample, r1, r2))
 
-        sj_files = run_star_first_pass(workdir, first_pass_inputs, refs, args.threads)
+            if args.quantifier == "salmon":
+                quant_map[sample] = run_salmon_quant(workdir, sample, refs, args.threads)
+            else:
+                quant_map[sample] = run_kallisto_quant(workdir, sample, refs, args.threads)
 
-        fc_map: Dict[str, Path] = {}
-        rsem_map: Dict[str, Path] = {}
-        for sample, _, _ in samples:
-            fc_out, rsem_gene = process_sample(workdir, sample, refs, args.threads, args.stranded, sj_files)
-            fc_map[sample] = fc_out
-            rsem_map[sample] = rsem_gene
             completed_samples += 1
 
-        aggregate_featurecounts(fc_map, workdir / "counts/gene_integer_counts.tsv")
-        aggregate_rsem(
-            rsem_map,
+        aggregate_transcript_quant(
+            quant_map,
+            tx2gene_map,
+            args.quantifier,
             workdir / "abundance/gene_expected_counts.tsv",
             workdir / "abundance/gene_tpm.tsv",
         )
@@ -500,7 +434,6 @@ def execute(args: argparse.Namespace) -> int:
         )
 
         required_outputs = [
-            workdir / "counts/gene_integer_counts.tsv",
             workdir / "abundance/gene_expected_counts.tsv",
             workdir / "abundance/gene_tpm.tsv",
             workdir / "multiqc/multiqc_report.html",

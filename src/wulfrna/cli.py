@@ -17,6 +17,7 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser.add_argument("--genome", required=False, help="Genome key under reference root (optional)")
     run_parser.add_argument("--stranded", required=True, choices=["none", "forward", "reverse"], help="Library strandedness")
     run_parser.add_argument("--threads", required=True, type=int, help="Total threads")
+    run_parser.add_argument("--quantifier", choices=["salmon", "kallisto"], default="salmon", help="Transcript quantification backend")
     run_parser.add_argument("--dry-run", action="store_true", help="Validate inputs, write metadata, and exit without running analysis tools")
 
     return parser

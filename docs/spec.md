@@ -7,29 +7,31 @@ WulfRNA is a single-server paired-end bulk RNA-seq pipeline exposed as a package
 Primary command:
 
 ```bash
-wulfrna run WORKDIR --reference REFDIR --stranded {none|forward|reverse} --threads N [--dry-run] [--genome NAME]
+wulfrna run WORKDIR --reference REFDIR --stranded {none|forward|reverse} --threads N [--quantifier {salmon|kallisto}] [--dry-run] [--genome NAME]
 ```
 
 - `WORKDIR` must contain `fastq/` with `*_R1.fastq.gz` + matching `*_R2.fastq.gz`.
 - `--reference` points to a reference root.
 - `--genome` (optional) resolves references under `<reference>/<genome>/`.
+- `--quantifier` defaults to `salmon` and selects transcript quant backend.
 
 ## Required external tools
 All must be in `PATH`:
 - fastqc
 - cutadapt
-- STAR
-- samtools
-- featureCounts
-- rsem-calculate-expression
 - multiqc
+- salmon (if `--quantifier salmon`)
+- kallisto (if `--quantifier kallisto`)
 
 ## Required reference files (resolved reference directory)
-- `star_index/`
-- `annotation.gtf`
-- `featurecounts.gtf`
-- `rsem_reference.grp`
-- `rsem_reference.ti`
+Shared:
+- `combined_tx2gene.tsv`
+
+Salmon backend:
+- `salmon_index/`
+
+kallisto backend:
+- `kallisto_index/combined_transcripts.kidx`
 
 ## Pipeline behavior
 1. Validate tools, references, and sample pairing.
@@ -39,17 +41,13 @@ All must be in `PATH`:
    - FastQC on raw FASTQ
    - Cutadapt trimming
    - FastQC on trimmed FASTQ
-   - STAR first pass per sample
-   - STAR second pass per sample with combined splice junctions
-   - samtools index/flagstat/stats
-   - featureCounts per sample, then aggregate matrix
-   - RSEM per sample, then aggregate expected-count and TPM matrices
+   - Transcript quantification per sample (`salmon quant` or `kallisto quant`)
+   - Aggregate transcript-level estimates to gene-level using `combined_tx2gene.tsv`
    - MultiQC over the work directory
 5. Verify required final outputs exist.
 
 ## Output contracts
 Primary outputs:
-- `counts/gene_integer_counts.tsv`
 - `abundance/gene_expected_counts.tsv`
 - `abundance/gene_tpm.tsv`
 - `multiqc/multiqc_report.html`

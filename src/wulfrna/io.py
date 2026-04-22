@@ -3,6 +3,7 @@ from __future__ import annotations
 import datetime as dt
 import socket
 import subprocess
+import shutil
 from pathlib import Path
 
 
@@ -29,13 +30,14 @@ def capture_versions_file(out: Path) -> None:
         version_cmds = {
             "fastqc": ["fastqc", "--version"],
             "cutadapt": ["cutadapt", "--version"],
-            "STAR": ["STAR", "--version"],
-            "samtools": ["samtools", "--version"],
-            "featureCounts": ["featureCounts", "-v"],
-            "rsem-calculate-expression": ["rsem-calculate-expression", "--version"],
+            "salmon": ["salmon", "--version"],
+            "kallisto": ["kallisto", "version"],
             "multiqc": ["multiqc", "--version"],
         }
         for name, cmd in version_cmds.items():
+            if shutil.which(cmd[0]) is None:
+                f.write(f"{name}: not found\n")
+                continue
             p = subprocess.run(cmd, capture_output=True, text=True)
             txt = (p.stdout or p.stderr).strip().splitlines()
             ver = txt[0] if txt else "unknown"
