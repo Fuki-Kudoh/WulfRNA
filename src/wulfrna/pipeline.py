@@ -132,18 +132,26 @@ def parse_tx2gene(tx2gene_tsv: Path) -> Dict[str, str]:
     mapping: Dict[str, str] = {}
     with tx2gene_tsv.open("r", encoding="utf-8") as f:
         reader = csv.reader(f, delimiter="\t")
-        header = next(reader, None)
-        if header is None:
+        first_row = next(reader, None)
+        if first_row is None:
             raise PipelineError(f"Empty tx2gene file: {tx2gene_tsv}", step="tx2gene")
 
         tx_idx = 0
         gene_idx = 1
-        lower_header = [h.strip().lower() for h in header]
-        if "transcript_id" in lower_header and "gene_id" in lower_header:
+        rows = []
+        lower_first_row = [h.strip().lower() for h in first_row]
+        if "transcript_id" in lower_first_row and "gene_id" in lower_first_row:
+            header = first_row
+            lower_header = [h.strip().lower() for h in header]
             tx_idx = lower_header.index("transcript_id")
             gene_idx = lower_header.index("gene_id")
+        else:
+            rows.append((1, first_row))
 
         for row_num, row in enumerate(reader, start=2):
+            rows.append((row_num, row))
+
+        for row_num, row in rows:
             if len(row) <= max(tx_idx, gene_idx):
                 raise PipelineError(f"Malformed tx2gene row {row_num} in {tx2gene_tsv}", step="tx2gene")
             tx_id = row[tx_idx].strip()
@@ -157,10 +165,11 @@ def parse_tx2gene(tx2gene_tsv: Path) -> Dict[str, str]:
     return mapping
 
 
-def run_salmon_quant(workdir: Path, sample: str, refs: Dict[str, Path], threads: int) -> Path:
+def run_salmon_quant(workdir: Path, sample: str, refs: Dict[str, Path], threads: int, stranded: str) -> Path:
     trimmed_r1 = workdir / "trimmed" / f"{sample}_R1.trimmed.fastq.gz"
     trimmed_r2 = workdir / "trimmed" / f"{sample}_R2.trimmed.fastq.gz"
     sample_dir = workdir / "abundance" / "salmon" / sample
+    salmon_libtype = {"none": "IU", "forward": "ISF", "reverse": "ISR"}[stranded]
     run_cmd(
         [
             "salmon",
@@ -168,7 +177,7 @@ def run_salmon_quant(workdir: Path, sample: str, refs: Dict[str, Path], threads:
             "-i",
             str(refs["index"]),
             "-l",
-            "A",
+            salmon_libtype,
             "--validateMappings",
             "--seqBias",
             "--gcBias",
@@ -191,23 +200,27 @@ def run_salmon_quant(workdir: Path, sample: str, refs: Dict[str, Path], threads:
     return quant_sf
 
 
-def run_kallisto_quant(workdir: Path, sample: str, refs: Dict[str, Path], threads: int) -> Path:
+def run_kallisto_quant(workdir: Path, sample: str, refs: Dict[str, Path], threads: int, stranded: str) -> Path:
     trimmed_r1 = workdir / "trimmed" / f"{sample}_R1.trimmed.fastq.gz"
     trimmed_r2 = workdir / "trimmed" / f"{sample}_R2.trimmed.fastq.gz"
     sample_dir = workdir / "abundance" / "kallisto" / sample
+    cmd = [
+        "kallisto",
+        "quant",
+        "-i",
+        str(refs["index"]),
+        "-t",
+        str(threads),
+        "-o",
+        str(sample_dir),
+    ]
+    if stranded == "forward":
+        cmd.append("--fr-stranded")
+    elif stranded == "reverse":
+        cmd.append("--rf-stranded")
+    cmd.extend([str(trimmed_r1), str(trimmed_r2)])
     run_cmd(
-        [
-            "kallisto",
-            "quant",
-            "-i",
-            str(refs["index"]),
-            "-t",
-            str(threads),
-            "-o",
-            str(sample_dir),
-            str(trimmed_r1),
-            str(trimmed_r2),
-        ],
+        cmd,
         workdir / "logs/steps" / f"{sample}.kallisto.log",
         step="kallisto_quant",
         sample=sample,
@@ -228,6 +241,8 @@ def aggregate_transcript_quant(
     quantifier: str,
     out_expected: Path,
     out_tpm: Path,
+    mapping_stats_out: Path,
+    min_mapping_rate: float,
 ) -> None:
     sample_order = sorted(sample_quant_files)
     expected_by_gene: Dict[str, Dict[str, float]] = defaultdict(dict)
@@ -242,36 +257,60 @@ def aggregate_transcript_quant(
     else:
         raise PipelineError(f"Unsupported quantifier for aggregation: {quantifier}", step="aggregate")
 
-    for sample in sample_order:
-        sample_exp: Dict[str, float] = defaultdict(float)
-        sample_tpm: Dict[str, float] = defaultdict(float)
+    mapping_stats_out.parent.mkdir(parents=True, exist_ok=True)
+    with mapping_stats_out.open("w", encoding="utf-8", newline="") as stats_f:
+        stats_writer = csv.writer(stats_f, delimiter="\t")
+        stats_writer.writerow(["sample_id", "total_transcripts", "mapped_transcripts", "mapping_rate"])
+        for sample in sample_order:
+            sample_exp: Dict[str, float] = defaultdict(float)
+            sample_tpm: Dict[str, float] = defaultdict(float)
 
-        path = sample_quant_files[sample]
-        with path.open("r", encoding="utf-8") as f:
-            reader = csv.DictReader(f, delimiter="\t")
-            if reader.fieldnames is None:
-                raise PipelineError(f"Quantification file is missing header: {path}", step=step, sample=sample)
+            path = sample_quant_files[sample]
+            total_transcripts = 0
+            mapped_transcripts = 0
+            with path.open("r", encoding="utf-8") as f:
+                reader = csv.DictReader(f, delimiter="\t")
+                if reader.fieldnames is None:
+                    raise PipelineError(f"Quantification file is missing header: {path}", step=step, sample=sample)
 
-            required_cols = {tx_col, exp_col, tpm_col}
-            if not required_cols.issubset(set(reader.fieldnames)):
+                required_cols = {tx_col, exp_col, tpm_col}
+                if not required_cols.issubset(set(reader.fieldnames)):
+                    raise PipelineError(
+                        f"Quantification file missing required columns ({', '.join(sorted(required_cols))}): {path}",
+                        step=step,
+                        sample=sample,
+                    )
+
+                for row in reader:
+                    total_transcripts += 1
+                    tx_id = row[tx_col]
+                    gene_id = tx2gene_map.get(tx_id)
+                    if gene_id is None:
+                        continue
+                    mapped_transcripts += 1
+                    sample_exp[gene_id] += float(row[exp_col])
+                    sample_tpm[gene_id] += float(row[tpm_col])
+
+            if total_transcripts == 0:
+                raise PipelineError(f"No transcript records found in quantification file: {path}", step=step, sample=sample)
+
+            mapping_rate = mapped_transcripts / total_transcripts
+            stats_writer.writerow([sample, total_transcripts, mapped_transcripts, f"{mapping_rate:.6f}"])
+            if mapping_rate < min_mapping_rate:
                 raise PipelineError(
-                    f"Quantification file missing required columns ({', '.join(sorted(required_cols))}): {path}",
+                    (
+                        f"Low tx2gene mapping rate for sample {sample}: "
+                        f"{mapping_rate:.4f} < {min_mapping_rate:.4f} "
+                        f"(mapped {mapped_transcripts}/{total_transcripts})"
+                    ),
                     step=step,
                     sample=sample,
                 )
 
-            for row in reader:
-                tx_id = row[tx_col]
-                gene_id = tx2gene_map.get(tx_id)
-                if gene_id is None:
-                    continue
-                sample_exp[gene_id] += float(row[exp_col])
-                sample_tpm[gene_id] += float(row[tpm_col])
-
-        for gene_id, value in sample_exp.items():
-            expected_by_gene[gene_id][sample] = value
-        for gene_id, value in sample_tpm.items():
-            tpm_by_gene[gene_id][sample] = value
+            for gene_id, value in sample_exp.items():
+                expected_by_gene[gene_id][sample] = value
+            for gene_id, value in sample_tpm.items():
+                tpm_by_gene[gene_id][sample] = value
 
     write_gene_matrix(out_expected, sample_order, expected_by_gene)
     write_gene_matrix(out_tpm, sample_order, tpm_by_gene)
@@ -412,9 +451,9 @@ def execute(args: argparse.Namespace) -> int:
             )
 
             if args.quantifier == "salmon":
-                quant_map[sample] = run_salmon_quant(workdir, sample, refs, args.threads)
+                quant_map[sample] = run_salmon_quant(workdir, sample, refs, args.threads, args.stranded)
             else:
-                quant_map[sample] = run_kallisto_quant(workdir, sample, refs, args.threads)
+                quant_map[sample] = run_kallisto_quant(workdir, sample, refs, args.threads, args.stranded)
 
             completed_samples += 1
 
@@ -424,6 +463,8 @@ def execute(args: argparse.Namespace) -> int:
             args.quantifier,
             workdir / "abundance/gene_expected_counts.tsv",
             workdir / "abundance/gene_tpm.tsv",
+            workdir / "logs" / "tx2gene_mapping_stats.tsv",
+            args.min_mapping_rate,
         )
 
         run_cmd(

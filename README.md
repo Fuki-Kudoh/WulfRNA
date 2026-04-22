@@ -3,7 +3,7 @@
 WulfRNA is a packaged CLI for a focused bulk RNA-seq workflow on paired-end FASTQ input.
 
 Current outputs:
-- gene-level expected counts (aggregated from transcript quantification)
+- gene-level expected counts as floating-point values (aggregated from transcript quantification)
 - gene-level TPM (aggregated from transcript quantification)
 - final MultiQC report
 
@@ -63,8 +63,11 @@ Arguments:
 - `WORKDIR` (positional): working directory containing `fastq/`
 - `--reference PATH` (required): prepared reference directory
 - `--stranded {none|forward|reverse}` (required): library strandedness
+  - Salmon mapping: `none -> IU`, `forward -> ISF`, `reverse -> ISR`
+  - kallisto mapping: `none -> (unstranded default)`, `forward -> --fr-stranded`, `reverse -> --rf-stranded`
 - `--threads N` (required): total threads (`N >= 1`)
 - `--quantifier {salmon|kallisto}` (optional, default `salmon`)
+- `--min-mapping-rate FLOAT` (optional, default `0.90`): minimum acceptable tx2gene transcript mapping rate per sample (`0.0-1.0`)
 - `--dry-run` (optional): validate tools/reference/inputs, write metadata/status, then exit
 - `--genome NAME` (optional): resolve references as `<reference>/<NAME>/...`
 
@@ -88,6 +91,10 @@ Expected primary outputs on full success:
 - `abundance/gene_expected_counts.tsv`
 - `abundance/gene_tpm.tsv`
 - `multiqc/multiqc_report.html`
+- `logs/tx2gene_mapping_stats.tsv`
+
+Matrix behavior note:
+- Gene-level matrices include only genes observed in the transcript quantification input (unobserved zero-only genes are not emitted).
 
 Status files in `WORKDIR/status/`:
 - during run: `RUNNING`
