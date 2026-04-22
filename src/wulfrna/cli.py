@@ -16,6 +16,13 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser.add_argument("--reference", required=True, help="Reference root directory")
     run_parser.add_argument("--genome", required=False, help="Genome key under reference root (optional)")
     run_parser.add_argument("--stranded", required=True, choices=["none", "forward", "reverse"], help="Library strandedness")
+    run_parser.add_argument(
+        "--min-mapping-rate",
+        required=False,
+        type=float,
+        default=0.90,
+        help="Minimum acceptable tx2gene transcript mapping rate per sample (0.0-1.0)",
+    )
     run_parser.add_argument("--threads", required=True, type=int, help="Total threads")
     run_parser.add_argument("--quantifier", choices=["salmon", "kallisto"], default="salmon", help="Transcript quantification backend")
     run_parser.add_argument("--dry-run", action="store_true", help="Validate inputs, write metadata, and exit without running analysis tools")
@@ -37,6 +44,8 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         parser.exit(2)
     if args.threads < 1:
         parser.error("--threads must be >= 1")
+    if args.min_mapping_rate < 0.0 or args.min_mapping_rate > 1.0:
+        parser.error("--min-mapping-rate must be between 0.0 and 1.0")
     return args
 
 
