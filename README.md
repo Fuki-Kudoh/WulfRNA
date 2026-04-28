@@ -70,6 +70,8 @@ Arguments:
 - `--min-mapping-rate FLOAT` (optional, default `0.90`): minimum acceptable tx2gene transcript mapping rate per sample (`0.0-1.0`)
 - `--dry-run` (optional): validate tools/reference/inputs, write metadata/status, then exit
 - `--genome NAME` (optional): resolve references as `<reference>/<NAME>/...`
+- `--no-resume` (optional): disable phase-level resume and rerun all phases
+- `--force-from {fastqc_raw,cutadapt,fastqc_trimmed,quant,aggregate,multiqc}` (optional): force rerun from the selected phase onward
 
 Backward-compatibility note: legacy invocation without explicit `run` is still accepted, but `wulfrna run ...` is the intended interface.
 
@@ -101,3 +103,44 @@ Status files in `WORKDIR/status/`:
 - full success: `SUCCESS`, `finished_at.txt`, `summary.txt`
 - dry-run success: `DRY_RUN_OK`, `finished_at.txt`, `summary.txt`
 - failure: `FAILED`, `failed_step.txt` (and optionally `failed_sample.txt`), `summary.txt`
+- phase checkpoint markers: `status/steps/<phase>.done` for each completed phase
+- run compatibility manifest: `status/manifest.json`
+
+## 7) Automatic resume behavior
+
+By default, `wulfrna run ...` automatically resumes at the **phase level** (not sample-level).
+
+Phases:
+- `fastqc_raw`
+- `cutadapt`
+- `fastqc_trimmed`
+- `quant`
+- `aggregate`
+- `multiqc`
+
+A phase is skipped only when:
+- `status/steps/<phase>.done` exists, and
+- expected outputs for that phase exist and are non-empty, and
+- `status/manifest.json` is compatible with the current run configuration.
+
+Conservative compatibility rules:
+- If sample IDs changed: resume is blocked with an error.
+- If `quantifier`, `reference_dir`, or `stranded` changed: `quant` and downstream phases rerun.
+- If `combined_tx2gene.tsv` fingerprint changed: `aggregate` and `multiqc` rerun.
+- If only thread count changed: resume is allowed.
+
+To fully disable resume:
+
+```bash
+wulfrna run WORKDIR --reference REFDIR --stranded reverse --threads 16 --no-resume
+```
+
+To rerun only aggregation/reporting after fixing `combined_tx2gene.tsv`:
+- preferred: `--force-from aggregate`, or
+- remove aggregate + multiqc outputs and rerun.
+
+Example:
+
+```bash
+wulfrna run WORKDIR --reference REFDIR --stranded reverse --threads 16 --force-from aggregate
+```

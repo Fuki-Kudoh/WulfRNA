@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
+import json
 import re
 import shutil
 import subprocess
@@ -11,6 +13,8 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 from .io import capture_versions_file, now_iso
+
+PHASES = ["fastqc_raw", "cutadapt", "fastqc_trimmed", "quant", "aggregate", "multiqc"]
 
 
 class PipelineError(Exception):
@@ -366,10 +370,164 @@ def ensure_dirs(workdir: Path) -> None:
         "logs",
         "logs/steps",
         "status",
+        "status/steps",
         "metadata",
     ]
     for d in required:
         (workdir / d).mkdir(parents=True, exist_ok=True)
+
+
+def phase_index(phase: str) -> int:
+    if phase not in PHASES:
+        raise PipelineError(f"Unknown phase: {phase}", step="resume")
+    return PHASES.index(phase)
+
+
+def step_done_file(workdir: Path, phase: str) -> Path:
+    return workdir / "status" / "steps" / f"{phase}.done"
+
+
+def mark_phase_done(workdir: Path, phase: str) -> None:
+    step_done_file(workdir, phase).write_text(now_iso() + "\n", encoding="utf-8")
+
+
+def output_exists_nonempty(path: Path) -> bool:
+    return path.exists() and path.is_file() and path.stat().st_size > 0
+
+
+def fastqc_prefix(fastq_path: Path) -> str:
+    name = fastq_path.name
+    for suffix in [".fastq.gz", ".fq.gz", ".fastq", ".fq"]:
+        if name.endswith(suffix):
+            return name[: -len(suffix)]
+    return fastq_path.stem
+
+
+def phase_outputs(workdir: Path, phase: str, samples: List[Tuple[str, Path, Path]], quantifier: str) -> List[Path]:
+    outputs: List[Path] = []
+    if phase == "fastqc_raw":
+        outdir = workdir / "qc" / "fastqc_raw"
+        for _, r1, r2 in samples:
+            for fq in [r1, r2]:
+                prefix = fastqc_prefix(fq)
+                outputs.append(outdir / f"{prefix}_fastqc.html")
+                outputs.append(outdir / f"{prefix}_fastqc.zip")
+    elif phase == "cutadapt":
+        for sample, _, _ in samples:
+            outputs.extend(
+                [
+                    workdir / "trimmed" / f"{sample}_R1.trimmed.fastq.gz",
+                    workdir / "trimmed" / f"{sample}_R2.trimmed.fastq.gz",
+                    workdir / "qc" / "cutadapt" / f"{sample}.cutadapt.json",
+                ]
+            )
+    elif phase == "fastqc_trimmed":
+        outdir = workdir / "qc" / "fastqc_trimmed"
+        for sample, _, _ in samples:
+            for fq in [workdir / "trimmed" / f"{sample}_R1.trimmed.fastq.gz", workdir / "trimmed" / f"{sample}_R2.trimmed.fastq.gz"]:
+                prefix = fastqc_prefix(fq)
+                outputs.append(outdir / f"{prefix}_fastqc.html")
+                outputs.append(outdir / f"{prefix}_fastqc.zip")
+    elif phase == "quant":
+        if quantifier == "salmon":
+            for sample, _, _ in samples:
+                outputs.append(workdir / "abundance" / "salmon" / sample / "quant.sf")
+        else:
+            for sample, _, _ in samples:
+                outputs.append(workdir / "abundance" / "kallisto" / sample / "abundance.tsv")
+    elif phase == "aggregate":
+        outputs.extend([workdir / "abundance/gene_expected_counts.tsv", workdir / "abundance/gene_tpm.tsv"])
+    elif phase == "multiqc":
+        outputs.append(workdir / "multiqc/multiqc_report.html")
+    else:
+        raise PipelineError(f"Unknown phase: {phase}", step="resume")
+    return outputs
+
+
+def outputs_exist(paths: List[Path]) -> bool:
+    return all(output_exists_nonempty(path) for path in paths)
+
+
+def is_phase_complete(workdir: Path, phase: str, samples: List[Tuple[str, Path, Path]], quantifier: str) -> bool:
+    return step_done_file(workdir, phase).exists() and outputs_exist(phase_outputs(workdir, phase, samples, quantifier))
+
+
+def fingerprint_file(path: Path) -> Dict[str, str]:
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    stat = path.stat()
+    return {"path": str(path), "size": str(stat.st_size), "mtime_ns": str(stat.st_mtime_ns), "sha256": h.hexdigest()}
+
+
+def load_manifest(workdir: Path) -> Optional[Dict[str, object]]:
+    manifest_path = workdir / "status" / "manifest.json"
+    if not manifest_path.exists():
+        return None
+    with manifest_path.open("r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def write_manifest(workdir: Path, manifest: Dict[str, object]) -> None:
+    manifest_path = workdir / "status" / "manifest.json"
+    existing = load_manifest(workdir)
+    if existing is not None and "created_at" in existing:
+        manifest["created_at"] = existing["created_at"]
+    elif "created_at" not in manifest:
+        manifest["created_at"] = now_iso()
+    manifest["updated_at"] = now_iso()
+    with manifest_path.open("w", encoding="utf-8") as f:
+        json.dump(manifest, f, indent=2, sort_keys=True)
+        f.write("\n")
+
+
+def compare_manifest(existing: Dict[str, object], current: Dict[str, object]) -> Tuple[Optional[str], List[str]]:
+    existing_samples = sorted(existing.get("sample_ids", []))
+    current_samples = sorted(current.get("sample_ids", []))
+    if existing_samples != current_samples:
+        raise PipelineError(
+            "Sample set changed since last run; refusing automatic resume. Adjust inputs or run in a new workdir.",
+            step="resume",
+        )
+
+    forced_phase: Optional[str] = None
+    reasons: List[str] = []
+
+    def force_from(phase: str, reason: str) -> None:
+        nonlocal forced_phase
+        reasons.append(reason)
+        if forced_phase is None or phase_index(phase) < phase_index(forced_phase):
+            forced_phase = phase
+
+    if existing.get("quantifier") != current.get("quantifier"):
+        force_from("quant", "quantifier changed")
+    if existing.get("reference_dir") != current.get("reference_dir"):
+        force_from("quant", "reference_dir changed")
+    if existing.get("stranded") != current.get("stranded"):
+        force_from("quant", "stranded changed")
+
+    old_fp = existing.get("tx2gene_fingerprint", {})
+    new_fp = current.get("tx2gene_fingerprint", {})
+    if old_fp != new_fp:
+        force_from("aggregate", "combined_tx2gene.tsv fingerprint changed")
+
+    return forced_phase, reasons
+
+
+def should_run_phase(
+    workdir: Path,
+    phase: str,
+    samples: List[Tuple[str, Path, Path]],
+    quantifier: str,
+    no_resume: bool,
+    effective_force_from: Optional[str],
+) -> bool:
+    if no_resume:
+        return True
+    if effective_force_from is not None and phase_index(phase) >= phase_index(effective_force_from):
+        return True
+    return not is_phase_complete(workdir, phase, samples, quantifier)
 
 
 def execute(args: argparse.Namespace) -> int:
@@ -393,11 +551,31 @@ def execute(args: argparse.Namespace) -> int:
 
         reference_dir = resolve_reference_dir(reference_root, args.genome)
         refs = validate_reference(reference_dir, args.quantifier)
-        tx2gene_map = parse_tx2gene(refs["tx2gene"])
-
         samples = detect_samples(workdir)
+        tx2gene_map = parse_tx2gene(refs["tx2gene"])
         write_params(workdir, args)
         capture_versions(workdir)
+
+        manifest: Dict[str, object] = {
+            "workdir": str(workdir),
+            "reference_dir": str(reference_dir),
+            "quantifier": args.quantifier,
+            "stranded": args.stranded,
+            "sample_ids": [sample for sample, _, _ in samples],
+            "reference_files": {
+                "index": str(refs["index"]),
+                "combined_tx2gene_tsv": str(refs["tx2gene"]),
+            },
+            "tx2gene_fingerprint": fingerprint_file(refs["tx2gene"]),
+        }
+        existing_manifest = load_manifest(workdir)
+        auto_force_from: Optional[str] = None
+        manifest_reasons: List[str] = []
+        if existing_manifest is not None:
+            auto_force_from, manifest_reasons = compare_manifest(existing_manifest, manifest)
+            if auto_force_from is not None:
+                print(f"[force] {auto_force_from} (manifest: {', '.join(manifest_reasons)})")
+        write_manifest(workdir, manifest)
 
         if args.dry_run:
             (status_dir / "DRY_RUN_OK").write_text(now_iso() + "\n", encoding="utf-8")
@@ -415,64 +593,102 @@ def execute(args: argparse.Namespace) -> int:
             )
             return 0
 
+        effective_force_from = args.force_from
+        if auto_force_from is not None and (
+            effective_force_from is None or phase_index(auto_force_from) < phase_index(effective_force_from)
+        ):
+            effective_force_from = auto_force_from
+
         quant_map: Dict[str, Path] = {}
-        for sample, r1, r2 in samples:
-            trimmed_r1 = workdir / "trimmed" / f"{sample}_R1.trimmed.fastq.gz"
-            trimmed_r2 = workdir / "trimmed" / f"{sample}_R2.trimmed.fastq.gz"
-            run_cmd(
-                ["fastqc", "-t", str(max(1, args.threads // 2)), "-o", str(workdir / "qc/fastqc_raw"), str(r1), str(r2)],
-                workdir / "logs/steps" / f"{sample}.fastqc_raw.log",
-                step="fastqc_raw",
-                sample=sample,
-            )
-            run_cmd(
-                [
-                    "cutadapt",
-                    "-j",
-                    str(max(1, args.threads // 2)),
-                    "-o",
-                    str(trimmed_r1),
-                    "-p",
-                    str(trimmed_r2),
-                    "--json",
-                    str(workdir / "qc/cutadapt" / f"{sample}.cutadapt.json"),
-                    str(r1),
-                    str(r2),
-                ],
-                workdir / "logs/steps" / f"{sample}.cutadapt.log",
-                step="cutadapt",
-                sample=sample,
-            )
-            run_cmd(
-                ["fastqc", "-t", str(max(1, args.threads // 2)), "-o", str(workdir / "qc/fastqc_trimmed"), str(trimmed_r1), str(trimmed_r2)],
-                workdir / "logs/steps" / f"{sample}.fastqc_trimmed.log",
-                step="fastqc_trimmed",
-                sample=sample,
-            )
-
-            if args.quantifier == "salmon":
-                quant_map[sample] = run_salmon_quant(workdir, sample, refs, args.threads, args.stranded)
+        for phase in PHASES:
+            phase_should_run = should_run_phase(workdir, phase, samples, args.quantifier, args.no_resume, effective_force_from)
+            if not phase_should_run:
+                print(f"[skip] {phase}")
+                continue
+            if args.no_resume:
+                print(f"[resume disabled] {phase}")
+            elif effective_force_from is not None and phase_index(phase) >= phase_index(effective_force_from):
+                print(f"[force] {phase}")
             else:
-                quant_map[sample] = run_kallisto_quant(workdir, sample, refs, args.threads, args.stranded)
+                print(f"[run] {phase}")
 
-            completed_samples += 1
+            if phase == "fastqc_raw":
+                for sample, r1, r2 in samples:
+                    run_cmd(
+                        ["fastqc", "-t", str(max(1, args.threads // 2)), "-o", str(workdir / "qc/fastqc_raw"), str(r1), str(r2)],
+                        workdir / "logs/steps" / f"{sample}.fastqc_raw.log",
+                        step="fastqc_raw",
+                        sample=sample,
+                    )
+            elif phase == "cutadapt":
+                for sample, r1, r2 in samples:
+                    trimmed_r1 = workdir / "trimmed" / f"{sample}_R1.trimmed.fastq.gz"
+                    trimmed_r2 = workdir / "trimmed" / f"{sample}_R2.trimmed.fastq.gz"
+                    run_cmd(
+                        [
+                            "cutadapt",
+                            "-j",
+                            str(max(1, args.threads // 2)),
+                            "-o",
+                            str(trimmed_r1),
+                            "-p",
+                            str(trimmed_r2),
+                            "--json",
+                            str(workdir / "qc/cutadapt" / f"{sample}.cutadapt.json"),
+                            str(r1),
+                            str(r2),
+                        ],
+                        workdir / "logs/steps" / f"{sample}.cutadapt.log",
+                        step="cutadapt",
+                        sample=sample,
+                    )
+            elif phase == "fastqc_trimmed":
+                for sample, _, _ in samples:
+                    trimmed_r1 = workdir / "trimmed" / f"{sample}_R1.trimmed.fastq.gz"
+                    trimmed_r2 = workdir / "trimmed" / f"{sample}_R2.trimmed.fastq.gz"
+                    run_cmd(
+                        ["fastqc", "-t", str(max(1, args.threads // 2)), "-o", str(workdir / "qc/fastqc_trimmed"), str(trimmed_r1), str(trimmed_r2)],
+                        workdir / "logs/steps" / f"{sample}.fastqc_trimmed.log",
+                        step="fastqc_trimmed",
+                        sample=sample,
+                    )
+            elif phase == "quant":
+                for sample, _, _ in samples:
+                    if args.quantifier == "salmon":
+                        quant_map[sample] = run_salmon_quant(workdir, sample, refs, args.threads, args.stranded)
+                    else:
+                        quant_map[sample] = run_kallisto_quant(workdir, sample, refs, args.threads, args.stranded)
+                completed_samples = len(samples)
+            elif phase == "aggregate":
+                if not quant_map:
+                    for sample, _, _ in samples:
+                        if args.quantifier == "salmon":
+                            quant_map[sample] = workdir / "abundance" / "salmon" / sample / "quant.sf"
+                        else:
+                            quant_map[sample] = workdir / "abundance" / "kallisto" / sample / "abundance.tsv"
+                aggregate_transcript_quant(
+                    quant_map,
+                    tx2gene_map,
+                    args.quantifier,
+                    workdir / "abundance/gene_expected_counts.tsv",
+                    workdir / "abundance/gene_tpm.tsv",
+                    workdir / "logs" / "tx2gene_mapping_stats.tsv",
+                    args.min_mapping_rate,
+                )
+            elif phase == "multiqc":
+                run_cmd(
+                    ["multiqc", str(workdir), "-o", str(workdir / "multiqc")],
+                    workdir / "logs/steps" / "multiqc.log",
+                    step="multiqc",
+                    sample=None,
+                )
+            else:
+                raise PipelineError(f"Unhandled phase: {phase}", step="resume")
 
-        aggregate_transcript_quant(
-            quant_map,
-            tx2gene_map,
-            args.quantifier,
-            workdir / "abundance/gene_expected_counts.tsv",
-            workdir / "abundance/gene_tpm.tsv",
-            workdir / "logs" / "tx2gene_mapping_stats.tsv",
-            args.min_mapping_rate,
-        )
-
-        run_cmd(
-            ["multiqc", str(workdir), "-o", str(workdir / "multiqc")],
-            workdir / "logs/steps" / "multiqc.log",
-            step="multiqc",
-            sample=None,
-        )
+            if not outputs_exist(phase_outputs(workdir, phase, samples, args.quantifier)):
+                raise PipelineError(f"Expected outputs missing after phase: {phase}", step=phase)
+            mark_phase_done(workdir, phase)
+            print(f"[done] {phase}")
 
         required_outputs = [
             workdir / "abundance/gene_expected_counts.tsv",
@@ -487,6 +703,7 @@ def execute(args: argparse.Namespace) -> int:
         (status_dir / "finished_at.txt").write_text(now_iso() + "\n", encoding="utf-8")
         if running.exists():
             running.unlink()
+        write_manifest(workdir, manifest)
 
         write_summary(
             workdir,
