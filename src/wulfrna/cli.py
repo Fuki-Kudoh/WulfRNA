@@ -26,6 +26,12 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser.add_argument("--threads", required=True, type=int, help="Total threads")
     run_parser.add_argument("--quantifier", choices=["salmon", "kallisto"], default="salmon", help="Transcript quantification backend")
     run_parser.add_argument("--dry-run", action="store_true", help="Validate inputs, write metadata, and exit without running analysis tools")
+    run_parser.add_argument("--no-resume", action="store_true", help="Disable automatic phase-level resume and rerun all phases")
+    run_parser.add_argument(
+        "--force-from",
+        choices=["fastqc_raw", "cutadapt", "fastqc_trimmed", "quant", "aggregate", "multiqc"],
+        help="Force rerun from the selected phase onward",
+    )
 
     return parser
 
