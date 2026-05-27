@@ -25,6 +25,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     run_parser.add_argument("--threads", required=True, type=int, help="Total threads")
     run_parser.add_argument("--quantifier", choices=["salmon", "kallisto"], default="salmon", help="Transcript quantification backend")
+    run_parser.add_argument("--single-end", "--SE", dest="single_end", action="store_true", help="Use single-end FASTQ input layout")
+    run_parser.add_argument("--fragment-length", type=float, help="Single-end fragment length for kallisto")
+    run_parser.add_argument("--fragment-sd", type=float, help="Single-end fragment length standard deviation for kallisto")
     run_parser.add_argument("--dry-run", action="store_true", help="Validate inputs, write metadata, and exit without running analysis tools")
     run_parser.add_argument("--no-resume", action="store_true", help="Disable automatic phase-level resume and rerun all phases")
     run_parser.add_argument(
@@ -52,6 +55,11 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         parser.error("--threads must be >= 1")
     if args.min_mapping_rate < 0.0 or args.min_mapping_rate > 1.0:
         parser.error("--min-mapping-rate must be between 0.0 and 1.0")
+    if args.single_end and args.quantifier == "kallisto":
+        if args.fragment_length is None or args.fragment_sd is None:
+            parser.error("--single-end --quantifier kallisto requires --fragment-length and --fragment-sd")
+        if args.fragment_length <= 0 or args.fragment_sd <= 0:
+            parser.error("--fragment-length and --fragment-sd must be > 0")
     return args
 
 

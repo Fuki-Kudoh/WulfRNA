@@ -1,6 +1,6 @@
 # WulfRNA
 
-WulfRNA is a packaged CLI for a focused bulk RNA-seq workflow on paired-end FASTQ input.
+WulfRNA is a packaged CLI for a focused bulk RNA-seq workflow on paired-end (default) or single-end FASTQ input.
 
 Current outputs:
 - gene-level expected counts as floating-point values (aggregated from transcript quantification)
@@ -40,10 +40,17 @@ This installs the `wulfrna` command.
 
 ### Work directory
 
-`WORKDIR` must contain `fastq/` with strict paired-end naming:
+`WORKDIR` must contain `fastq/` and uses an explicit input layout:
+
+#### `paired_end` (default)
 
 - `sample_id_R1.fastq.gz`
 - `sample_id_R2.fastq.gz`
+
+#### `single_end` (enable with `--single-end` or `--SE`)
+
+- `sample_id.fastq.gz` **or** `sample_id_R1.fastq.gz`
+- `*_R2.fastq.gz` files are not allowed in single-end mode (run fails if present).
 
 ### Reference directory
 
@@ -67,6 +74,8 @@ Arguments:
   - kallisto mapping: `none -> (unstranded default)`, `forward -> --fr-stranded`, `reverse -> --rf-stranded`
 - `--threads N` (required): total threads (`N >= 1`)
 - `--quantifier {salmon|kallisto}` (optional, default `salmon`)
+- `--single-end`, `--SE` (optional): switch layout from `paired_end` to `single_end`
+- `--fragment-length FLOAT` and `--fragment-sd FLOAT` (single-end kallisto only; both required and must be `> 0`)
 - `--min-mapping-rate FLOAT` (optional, default `0.90`): minimum acceptable tx2gene transcript mapping rate per sample (`0.0-1.0`)
 - `--dry-run` (optional): validate tools/reference/inputs, write metadata/status, then exit
 - `--genome NAME` (optional): resolve references as `<reference>/<NAME>/...`
@@ -85,7 +94,10 @@ wulfrna run <workdir> --reference <reference_dir> --stranded reverse --threads 4
 ```
 
 Notes:
-- For dry-run to pass, required binaries must be in `PATH`, references must be complete for the selected quantifier, and `<workdir>/fastq` must contain at least one valid R1/R2 pair.
+- For dry-run to pass, required binaries must be in `PATH`, references must be complete for the selected quantifier, and `<workdir>/fastq` must contain valid FASTQ inputs for the selected layout (`paired_end` or `single_end`).
+- Single-end examples:
+  - Salmon: `wulfrna run WORKDIR --reference REFDIR --stranded reverse --threads 4 --single-end --dry-run`
+  - kallisto: `wulfrna run WORKDIR --reference REFDIR --stranded reverse --threads 4 --single-end --quantifier kallisto --fragment-length 200 --fragment-sd 20 --dry-run`
 
 ## 6) Main outputs and status markers
 
@@ -125,6 +137,7 @@ A phase is skipped only when:
 
 Conservative compatibility rules:
 - If sample IDs changed: resume is blocked with an error.
+- If input layout changed (`paired_end` vs `single_end`): automatic resume is blocked with an error.
 - If `quantifier`, `reference_dir`, or `stranded` changed: `quant` and downstream phases rerun.
 - If `combined_tx2gene.tsv` fingerprint changed: `aggregate` and `multiqc` rerun.
 - If only thread count changed: resume is allowed.

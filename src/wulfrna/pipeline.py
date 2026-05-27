@@ -9,12 +9,22 @@ import shutil
 import subprocess
 import sys
 from collections import defaultdict
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 from .io import capture_versions_file, now_iso
 
 PHASES = ["fastqc_raw", "cutadapt", "fastqc_trimmed", "quant", "aggregate", "multiqc"]
+LAYOUT_PAIRED = "paired_end"
+LAYOUT_SINGLE = "single_end"
+
+
+@dataclass(frozen=True)
+class Sample:
+    sample_id: str
+    r1: Path
+    r2: Optional[Path] = None
 
 
 class PipelineError(Exception):
@@ -75,49 +85,76 @@ def validate_reference(reference_dir: Path, quantifier: str) -> Dict[str, Path]:
     return refs
 
 
-def detect_samples(workdir: Path) -> List[Tuple[str, Path, Path]]:
+def detect_samples(workdir: Path, single_end: bool) -> Tuple[str, List[Sample]]:
     fastq_dir = workdir / "fastq"
     if not fastq_dir.is_dir():
         raise PipelineError("workdir/fastq directory does not exist", step="sample_detection")
 
-    r1_files = sorted(fastq_dir.glob("*_R1.fastq.gz"))
-    if not r1_files:
-        raise PipelineError("No paired FASTQ files found in fastq/", step="sample_detection")
+    pattern_r1 = re.compile(r"^(?P<sample>.+)_R1\.fastq\.gz$")
+    pattern_r2 = re.compile(r"^(?P<sample>.+)_R2\.fastq\.gz$")
+    layout = LAYOUT_SINGLE if single_end else LAYOUT_PAIRED
+    sample_list: List[Sample] = []
+    if single_end:
+        r2_files = sorted(fastq_dir.glob("*_R2.fastq.gz"))
+        if r2_files:
+            raise PipelineError(
+                f"Single-end mode does not allow R2 FASTQs; found: {', '.join(p.name for p in r2_files)}",
+                step="sample_detection",
+            )
+        fastq_files = sorted(fastq_dir.glob("*.fastq.gz"))
+        samples: Dict[str, Path] = {}
+        for fq in fastq_files:
+            m = pattern_r1.match(fq.name)
+            sample_id = m.group("sample") if m else fq.name[: -len(".fastq.gz")]
+            if not sample_id:
+                raise PipelineError(f"Invalid sample id from filename: {fq.name}", step="sample_detection")
+            if sample_id in samples:
+                raise PipelineError(f"Conflicting sample interpretation for sample_id={sample_id}", step="sample_detection", sample=sample_id)
+            samples[sample_id] = fq
+        if not samples:
+            raise PipelineError("No single-end FASTQ files found in fastq/", step="sample_detection")
+        sample_list = [Sample(sample, fq) for sample, fq in sorted(samples.items())]
+    else:
+        r1_files = sorted(fastq_dir.glob("*_R1.fastq.gz"))
+        if not r1_files:
+            raise PipelineError("No paired FASTQ files found in fastq/", step="sample_detection")
+        samples: Dict[str, Tuple[Path, Path]] = {}
+        for r1 in r1_files:
+            m = pattern_r1.match(r1.name)
+            if not m:
+                continue
+            sample_id = m.group("sample")
+            if not sample_id:
+                raise PipelineError(f"Invalid sample id from filename: {r1.name}", step="sample_detection")
+            if sample_id in samples:
+                raise PipelineError(f"Conflicting sample interpretation for sample_id={sample_id}", step="sample_detection", sample=sample_id)
+            r2 = fastq_dir / f"{sample_id}_R2.fastq.gz"
+            if not r2.exists():
+                raise PipelineError(f"Missing R2 FASTQ for sample {sample_id}: {r2}", step="sample_detection", sample=sample_id)
+            samples[sample_id] = (r1, r2)
+        if not samples:
+            raise PipelineError("No valid sample pairs detected", step="sample_detection")
+        for r2 in fastq_dir.glob("*_R2.fastq.gz"):
+            m = pattern_r2.match(r2.name)
+            candidate = m.group("sample") if m else r2.name[: -len("_R2.fastq.gz")]
+            if candidate not in samples:
+                raise PipelineError(f"Orphan R2 FASTQ without matching R1: {r2.name}", step="sample_detection", sample=candidate)
+        sample_list = [Sample(sample, pair[0], pair[1]) for sample, pair in sorted(samples.items())]
 
-    samples: Dict[str, Tuple[Path, Path]] = {}
-    pattern = re.compile(r"^(?P<sample>.+)_R1\.fastq\.gz$")
-
-    for r1 in r1_files:
-        m = pattern.match(r1.name)
-        if not m:
-            continue
-        sample_id = m.group("sample")
-        if not sample_id:
-            raise PipelineError(f"Invalid sample id from filename: {r1.name}", step="sample_detection")
-        if sample_id in samples:
-            raise PipelineError(f"Conflicting sample interpretation for sample_id={sample_id}", step="sample_detection", sample=sample_id)
-        r2 = fastq_dir / f"{sample_id}_R2.fastq.gz"
-        if not r2.exists():
-            raise PipelineError(f"Missing R2 FASTQ for sample {sample_id}: {r2}", step="sample_detection", sample=sample_id)
-        samples[sample_id] = (r1, r2)
-
-    if not samples:
-        raise PipelineError("No valid sample pairs detected", step="sample_detection")
-
-    for r2 in fastq_dir.glob("*_R2.fastq.gz"):
-        candidate = r2.name[: -len("_R2.fastq.gz")]
-        if candidate not in samples:
-            raise PipelineError(f"Orphan R2 FASTQ without matching R1: {r2.name}", step="sample_detection", sample=candidate)
-
-    sample_list = sorted((sample, pair[0], pair[1]) for sample, pair in samples.items())
     samples_tsv = workdir / "samples.tsv"
     with samples_tsv.open("w", encoding="utf-8", newline="") as f:
         w = csv.writer(f, delimiter="\t")
-        w.writerow(["sample_id", "r1", "r2"])
-        for sample_id, r1, r2 in sample_list:
-            w.writerow([sample_id, str(r1.relative_to(workdir)), str(r2.relative_to(workdir))])
+        if single_end:
+            w.writerow(["sample_id", "r1"])
+            for sample in sample_list:
+                w.writerow([sample.sample_id, str(sample.r1.relative_to(workdir))])
+        else:
+            w.writerow(["sample_id", "r1", "r2"])
+            for sample in sample_list:
+                assert sample.r2 is not None
+                w.writerow([sample.sample_id, str(sample.r1.relative_to(workdir)), str(sample.r2.relative_to(workdir))])
 
-    return sample_list
+    return layout, sample_list
 
 
 def write_params(workdir: Path, args: argparse.Namespace) -> None:
@@ -169,13 +206,13 @@ def parse_tx2gene(tx2gene_tsv: Path) -> Dict[str, str]:
     return mapping
 
 
-def run_salmon_quant(workdir: Path, sample: str, refs: Dict[str, Path], threads: int, stranded: str) -> Path:
-    trimmed_r1 = workdir / "trimmed" / f"{sample}_R1.trimmed.fastq.gz"
-    trimmed_r2 = workdir / "trimmed" / f"{sample}_R2.trimmed.fastq.gz"
-    sample_dir = workdir / "abundance" / "salmon" / sample
-    salmon_libtype = {"none": "IU", "forward": "ISF", "reverse": "ISR"}[stranded]
-    run_cmd(
-        [
+def run_salmon_quant(workdir: Path, sample: Sample, refs: Dict[str, Path], threads: int, stranded: str, layout: str) -> Path:
+    sample_dir = workdir / "abundance" / "salmon" / sample.sample_id
+    if layout == LAYOUT_PAIRED:
+        trimmed_r1 = workdir / "trimmed" / f"{sample.sample_id}_R1.trimmed.fastq.gz"
+        trimmed_r2 = workdir / "trimmed" / f"{sample.sample_id}_R2.trimmed.fastq.gz"
+        salmon_libtype = {"none": "IU", "forward": "ISF", "reverse": "ISR"}[stranded]
+        cmd = [
             "salmon",
             "quant",
             "-i",
@@ -189,25 +226,28 @@ def run_salmon_quant(workdir: Path, sample: str, refs: Dict[str, Path], threads:
             str(trimmed_r1),
             "-2",
             str(trimmed_r2),
-            "-p",
-            str(threads),
-            "-o",
-            str(sample_dir),
-        ],
-        workdir / "logs/steps" / f"{sample}.salmon.log",
+        ]
+    else:
+        trimmed_r1 = workdir / "trimmed" / f"{sample.sample_id}.trimmed.fastq.gz"
+        salmon_libtype = {"none": "U", "forward": "SF", "reverse": "SR"}[stranded]
+        cmd = [
+            "salmon", "quant", "-i", str(refs["index"]), "-l", salmon_libtype, "--validateMappings", "--seqBias", "--gcBias", "-r", str(trimmed_r1)
+        ]
+    cmd.extend(["-p", str(threads), "-o", str(sample_dir)])
+    run_cmd(
+        cmd,
+        workdir / "logs/steps" / f"{sample.sample_id}.salmon.log",
         step="salmon_quant",
-        sample=sample,
+        sample=sample.sample_id,
     )
     quant_sf = sample_dir / "quant.sf"
     if not quant_sf.exists():
-        raise PipelineError(f"Missing Salmon quant file for sample {sample}: {quant_sf}", step="salmon_quant", sample=sample)
+        raise PipelineError(f"Missing Salmon quant file for sample {sample.sample_id}: {quant_sf}", step="salmon_quant", sample=sample.sample_id)
     return quant_sf
 
 
-def run_kallisto_quant(workdir: Path, sample: str, refs: Dict[str, Path], threads: int, stranded: str) -> Path:
-    trimmed_r1 = workdir / "trimmed" / f"{sample}_R1.trimmed.fastq.gz"
-    trimmed_r2 = workdir / "trimmed" / f"{sample}_R2.trimmed.fastq.gz"
-    sample_dir = workdir / "abundance" / "kallisto" / sample
+def run_kallisto_quant(workdir: Path, sample: Sample, refs: Dict[str, Path], threads: int, stranded: str, layout: str, fragment_length: Optional[float], fragment_sd: Optional[float]) -> Path:
+    sample_dir = workdir / "abundance" / "kallisto" / sample.sample_id
     cmd = [
         "kallisto",
         "quant",
@@ -222,19 +262,27 @@ def run_kallisto_quant(workdir: Path, sample: str, refs: Dict[str, Path], thread
         cmd.append("--fr-stranded")
     elif stranded == "reverse":
         cmd.append("--rf-stranded")
-    cmd.extend([str(trimmed_r1), str(trimmed_r2)])
+    if layout == LAYOUT_PAIRED:
+        trimmed_r1 = workdir / "trimmed" / f"{sample.sample_id}_R1.trimmed.fastq.gz"
+        trimmed_r2 = workdir / "trimmed" / f"{sample.sample_id}_R2.trimmed.fastq.gz"
+        cmd.extend([str(trimmed_r1), str(trimmed_r2)])
+    else:
+        trimmed_r1 = workdir / "trimmed" / f"{sample.sample_id}.trimmed.fastq.gz"
+        if fragment_length is None or fragment_sd is None:
+            raise PipelineError("Single-end kallisto requires --fragment-length and --fragment-sd", step="kallisto_quant", sample=sample.sample_id)
+        cmd.extend(["--single", "-l", str(fragment_length), "-s", str(fragment_sd), str(trimmed_r1)])
     run_cmd(
         cmd,
-        workdir / "logs/steps" / f"{sample}.kallisto.log",
+        workdir / "logs/steps" / f"{sample.sample_id}.kallisto.log",
         step="kallisto_quant",
-        sample=sample,
+        sample=sample.sample_id,
     )
     abundance_tsv = sample_dir / "abundance.tsv"
     if not abundance_tsv.exists():
         raise PipelineError(
-            f"Missing kallisto abundance file for sample {sample}: {abundance_tsv}",
+            f"Missing kallisto abundance file for sample {sample.sample_id}: {abundance_tsv}",
             step="kallisto_quant",
-            sample=sample,
+            sample=sample.sample_id,
         )
     return abundance_tsv
 
@@ -403,38 +451,38 @@ def fastqc_prefix(fastq_path: Path) -> str:
     return fastq_path.stem
 
 
-def phase_outputs(workdir: Path, phase: str, samples: List[Tuple[str, Path, Path]], quantifier: str) -> List[Path]:
+def phase_outputs(workdir: Path, phase: str, samples: List[Sample], quantifier: str, layout: str) -> List[Path]:
     outputs: List[Path] = []
     if phase == "fastqc_raw":
         outdir = workdir / "qc" / "fastqc_raw"
-        for _, r1, r2 in samples:
-            for fq in [r1, r2]:
+        for sample in samples:
+            fastqs = [sample.r1] if layout == LAYOUT_SINGLE else [sample.r1, sample.r2]
+            for fq in fastqs:
+                assert fq is not None
                 prefix = fastqc_prefix(fq)
                 outputs.append(outdir / f"{prefix}_fastqc.html")
                 outputs.append(outdir / f"{prefix}_fastqc.zip")
     elif phase == "cutadapt":
-        for sample, _, _ in samples:
-            outputs.extend(
-                [
-                    workdir / "trimmed" / f"{sample}_R1.trimmed.fastq.gz",
-                    workdir / "trimmed" / f"{sample}_R2.trimmed.fastq.gz",
-                    workdir / "qc" / "cutadapt" / f"{sample}.cutadapt.json",
-                ]
-            )
+        for sample in samples:
+            if layout == LAYOUT_SINGLE:
+                outputs.extend([workdir / "trimmed" / f"{sample.sample_id}.trimmed.fastq.gz", workdir / "qc" / "cutadapt" / f"{sample.sample_id}.cutadapt.json"])
+            else:
+                outputs.extend([workdir / "trimmed" / f"{sample.sample_id}_R1.trimmed.fastq.gz", workdir / "trimmed" / f"{sample.sample_id}_R2.trimmed.fastq.gz", workdir / "qc" / "cutadapt" / f"{sample.sample_id}.cutadapt.json"])
     elif phase == "fastqc_trimmed":
         outdir = workdir / "qc" / "fastqc_trimmed"
-        for sample, _, _ in samples:
-            for fq in [workdir / "trimmed" / f"{sample}_R1.trimmed.fastq.gz", workdir / "trimmed" / f"{sample}_R2.trimmed.fastq.gz"]:
+        for sample in samples:
+            trimmed_fastqs = [workdir / "trimmed" / f"{sample.sample_id}.trimmed.fastq.gz"] if layout == LAYOUT_SINGLE else [workdir / "trimmed" / f"{sample.sample_id}_R1.trimmed.fastq.gz", workdir / "trimmed" / f"{sample.sample_id}_R2.trimmed.fastq.gz"]
+            for fq in trimmed_fastqs:
                 prefix = fastqc_prefix(fq)
                 outputs.append(outdir / f"{prefix}_fastqc.html")
                 outputs.append(outdir / f"{prefix}_fastqc.zip")
     elif phase == "quant":
         if quantifier == "salmon":
-            for sample, _, _ in samples:
-                outputs.append(workdir / "abundance" / "salmon" / sample / "quant.sf")
+            for sample in samples:
+                outputs.append(workdir / "abundance" / "salmon" / sample.sample_id / "quant.sf")
         else:
-            for sample, _, _ in samples:
-                outputs.append(workdir / "abundance" / "kallisto" / sample / "abundance.tsv")
+            for sample in samples:
+                outputs.append(workdir / "abundance" / "kallisto" / sample.sample_id / "abundance.tsv")
     elif phase == "aggregate":
         outputs.extend([workdir / "abundance/gene_expected_counts.tsv", workdir / "abundance/gene_tpm.tsv"])
     elif phase == "multiqc":
@@ -448,8 +496,8 @@ def outputs_exist(paths: List[Path]) -> bool:
     return all(output_exists_nonempty(path) for path in paths)
 
 
-def is_phase_complete(workdir: Path, phase: str, samples: List[Tuple[str, Path, Path]], quantifier: str) -> bool:
-    return step_done_file(workdir, phase).exists() and outputs_exist(phase_outputs(workdir, phase, samples, quantifier))
+def is_phase_complete(workdir: Path, phase: str, samples: List[Sample], quantifier: str, layout: str) -> bool:
+    return step_done_file(workdir, phase).exists() and outputs_exist(phase_outputs(workdir, phase, samples, quantifier, layout))
 
 
 def fingerprint_file(path: Path) -> Dict[str, str]:
@@ -490,6 +538,12 @@ def compare_manifest(existing: Dict[str, object], current: Dict[str, object]) ->
             "Sample set changed since last run; refusing automatic resume. Adjust inputs or run in a new workdir.",
             step="resume",
         )
+    existing_layout = existing.get("layout", LAYOUT_PAIRED)
+    if existing_layout != current.get("layout"):
+        raise PipelineError(
+            f"Input layout changed since last run (existing={existing_layout}, current={current.get('layout')}); refusing automatic resume.",
+            step="resume",
+        )
 
     forced_phase: Optional[str] = None
     reasons: List[str] = []
@@ -518,8 +572,9 @@ def compare_manifest(existing: Dict[str, object], current: Dict[str, object]) ->
 def should_run_phase(
     workdir: Path,
     phase: str,
-    samples: List[Tuple[str, Path, Path]],
+    samples: List[Sample],
     quantifier: str,
+    layout: str,
     no_resume: bool,
     effective_force_from: Optional[str],
 ) -> bool:
@@ -527,7 +582,7 @@ def should_run_phase(
         return True
     if effective_force_from is not None and phase_index(phase) >= phase_index(effective_force_from):
         return True
-    return not is_phase_complete(workdir, phase, samples, quantifier)
+    return not is_phase_complete(workdir, phase, samples, quantifier, layout)
 
 
 def execute(args: argparse.Namespace) -> int:
@@ -542,7 +597,7 @@ def execute(args: argparse.Namespace) -> int:
     started = now_iso()
 
     completed_samples = 0
-    samples: List[Tuple[str, Path, Path]] = []
+    samples: List[Sample] = []
 
     try:
         base_tools = ["fastqc", "cutadapt", "multiqc"]
@@ -551,7 +606,7 @@ def execute(args: argparse.Namespace) -> int:
 
         reference_dir = resolve_reference_dir(reference_root, args.genome)
         refs = validate_reference(reference_dir, args.quantifier)
-        samples = detect_samples(workdir)
+        layout, samples = detect_samples(workdir, args.single_end)
         tx2gene_map = parse_tx2gene(refs["tx2gene"])
         write_params(workdir, args)
         capture_versions(workdir)
@@ -561,7 +616,8 @@ def execute(args: argparse.Namespace) -> int:
             "reference_dir": str(reference_dir),
             "quantifier": args.quantifier,
             "stranded": args.stranded,
-            "sample_ids": [sample for sample, _, _ in samples],
+            "layout": layout,
+            "sample_ids": [sample.sample_id for sample in samples],
             "reference_files": {
                 "index": str(refs["index"]),
                 "combined_tx2gene_tsv": str(refs["tx2gene"]),
@@ -601,7 +657,7 @@ def execute(args: argparse.Namespace) -> int:
 
         quant_map: Dict[str, Path] = {}
         for phase in PHASES:
-            phase_should_run = should_run_phase(workdir, phase, samples, args.quantifier, args.no_resume, effective_force_from)
+            phase_should_run = should_run_phase(workdir, phase, samples, args.quantifier, layout, args.no_resume, effective_force_from)
             if not phase_should_run:
                 print(f"[skip] {phase}")
                 continue
@@ -613,59 +669,50 @@ def execute(args: argparse.Namespace) -> int:
                 print(f"[run] {phase}")
 
             if phase == "fastqc_raw":
-                for sample, r1, r2 in samples:
+                for sample in samples:
+                    fastqs = [sample.r1] if layout == LAYOUT_SINGLE else [sample.r1, sample.r2]
                     run_cmd(
-                        ["fastqc", "-t", str(max(1, args.threads // 2)), "-o", str(workdir / "qc/fastqc_raw"), str(r1), str(r2)],
-                        workdir / "logs/steps" / f"{sample}.fastqc_raw.log",
+                        ["fastqc", "-t", str(max(1, args.threads // 2)), "-o", str(workdir / "qc/fastqc_raw"), *(str(fq) for fq in fastqs if fq is not None)],
+                        workdir / "logs/steps" / f"{sample.sample_id}.fastqc_raw.log",
                         step="fastqc_raw",
-                        sample=sample,
+                        sample=sample.sample_id,
                     )
             elif phase == "cutadapt":
-                for sample, r1, r2 in samples:
-                    trimmed_r1 = workdir / "trimmed" / f"{sample}_R1.trimmed.fastq.gz"
-                    trimmed_r2 = workdir / "trimmed" / f"{sample}_R2.trimmed.fastq.gz"
-                    run_cmd(
-                        [
-                            "cutadapt",
-                            "-j",
-                            str(max(1, args.threads // 2)),
-                            "-o",
-                            str(trimmed_r1),
-                            "-p",
-                            str(trimmed_r2),
-                            "--json",
-                            str(workdir / "qc/cutadapt" / f"{sample}.cutadapt.json"),
-                            str(r1),
-                            str(r2),
-                        ],
-                        workdir / "logs/steps" / f"{sample}.cutadapt.log",
-                        step="cutadapt",
-                        sample=sample,
-                    )
+                for sample in samples:
+                    cmd = ["cutadapt", "-j", str(max(1, args.threads // 2))]
+                    if layout == LAYOUT_SINGLE:
+                        cmd.extend(["-o", str(workdir / "trimmed" / f"{sample.sample_id}.trimmed.fastq.gz")])
+                    else:
+                        cmd.extend(["-o", str(workdir / "trimmed" / f"{sample.sample_id}_R1.trimmed.fastq.gz"), "-p", str(workdir / "trimmed" / f"{sample.sample_id}_R2.trimmed.fastq.gz")])
+                    cmd.extend(["--json", str(workdir / "qc/cutadapt" / f"{sample.sample_id}.cutadapt.json"), str(sample.r1)])
+                    if layout == LAYOUT_PAIRED and sample.r2 is not None:
+                        cmd.append(str(sample.r2))
+                    run_cmd(cmd, workdir / "logs/steps" / f"{sample.sample_id}.cutadapt.log", step="cutadapt", sample=sample.sample_id)
             elif phase == "fastqc_trimmed":
-                for sample, _, _ in samples:
-                    trimmed_r1 = workdir / "trimmed" / f"{sample}_R1.trimmed.fastq.gz"
-                    trimmed_r2 = workdir / "trimmed" / f"{sample}_R2.trimmed.fastq.gz"
+                for sample in samples:
+                    trimmed_fastqs = [workdir / "trimmed" / f"{sample.sample_id}.trimmed.fastq.gz"] if layout == LAYOUT_SINGLE else [workdir / "trimmed" / f"{sample.sample_id}_R1.trimmed.fastq.gz", workdir / "trimmed" / f"{sample.sample_id}_R2.trimmed.fastq.gz"]
                     run_cmd(
-                        ["fastqc", "-t", str(max(1, args.threads // 2)), "-o", str(workdir / "qc/fastqc_trimmed"), str(trimmed_r1), str(trimmed_r2)],
-                        workdir / "logs/steps" / f"{sample}.fastqc_trimmed.log",
+                        ["fastqc", "-t", str(max(1, args.threads // 2)), "-o", str(workdir / "qc/fastqc_trimmed"), *(str(fq) for fq in trimmed_fastqs)],
+                        workdir / "logs/steps" / f"{sample.sample_id}.fastqc_trimmed.log",
                         step="fastqc_trimmed",
-                        sample=sample,
+                        sample=sample.sample_id,
                     )
             elif phase == "quant":
-                for sample, _, _ in samples:
+                for sample in samples:
                     if args.quantifier == "salmon":
-                        quant_map[sample] = run_salmon_quant(workdir, sample, refs, args.threads, args.stranded)
+                        quant_map[sample.sample_id] = run_salmon_quant(workdir, sample, refs, args.threads, args.stranded, layout)
                     else:
-                        quant_map[sample] = run_kallisto_quant(workdir, sample, refs, args.threads, args.stranded)
+                        quant_map[sample.sample_id] = run_kallisto_quant(
+                            workdir, sample, refs, args.threads, args.stranded, layout, args.fragment_length, args.fragment_sd
+                        )
                 completed_samples = len(samples)
             elif phase == "aggregate":
                 if not quant_map:
-                    for sample, _, _ in samples:
+                    for sample in samples:
                         if args.quantifier == "salmon":
-                            quant_map[sample] = workdir / "abundance" / "salmon" / sample / "quant.sf"
+                            quant_map[sample.sample_id] = workdir / "abundance" / "salmon" / sample.sample_id / "quant.sf"
                         else:
-                            quant_map[sample] = workdir / "abundance" / "kallisto" / sample / "abundance.tsv"
+                            quant_map[sample.sample_id] = workdir / "abundance" / "kallisto" / sample.sample_id / "abundance.tsv"
                 aggregate_transcript_quant(
                     quant_map,
                     tx2gene_map,
@@ -685,7 +732,7 @@ def execute(args: argparse.Namespace) -> int:
             else:
                 raise PipelineError(f"Unhandled phase: {phase}", step="resume")
 
-            if not outputs_exist(phase_outputs(workdir, phase, samples, args.quantifier)):
+            if not outputs_exist(phase_outputs(workdir, phase, samples, args.quantifier, layout)):
                 raise PipelineError(f"Expected outputs missing after phase: {phase}", step=phase)
             mark_phase_done(workdir, phase)
             print(f"[done] {phase}")
