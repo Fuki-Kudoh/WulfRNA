@@ -113,7 +113,7 @@ def detect_samples(workdir: Path, single_end: bool) -> Tuple[str, List[Sample]]:
             samples[sample_id] = fq
         if not samples:
             raise PipelineError("No single-end FASTQ files found in fastq/", step="sample_detection")
-        sample_list = sorted(Sample(sample, fq) for sample, fq in samples.items())
+        sample_list = [Sample(sample, fq) for sample, fq in sorted(samples.items())]
     else:
         r1_files = sorted(fastq_dir.glob("*_R1.fastq.gz"))
         if not r1_files:
@@ -139,7 +139,7 @@ def detect_samples(workdir: Path, single_end: bool) -> Tuple[str, List[Sample]]:
             candidate = m.group("sample") if m else r2.name[: -len("_R2.fastq.gz")]
             if candidate not in samples:
                 raise PipelineError(f"Orphan R2 FASTQ without matching R1: {r2.name}", step="sample_detection", sample=candidate)
-        sample_list = sorted(Sample(sample, pair[0], pair[1]) for sample, pair in samples.items())
+        sample_list = [Sample(sample, pair[0], pair[1]) for sample, pair in sorted(samples.items())]
 
     samples_tsv = workdir / "samples.tsv"
     with samples_tsv.open("w", encoding="utf-8", newline="") as f:
@@ -538,6 +538,12 @@ def compare_manifest(existing: Dict[str, object], current: Dict[str, object]) ->
             "Sample set changed since last run; refusing automatic resume. Adjust inputs or run in a new workdir.",
             step="resume",
         )
+    existing_layout = existing.get("layout", LAYOUT_PAIRED)
+    if existing_layout != current.get("layout"):
+        raise PipelineError(
+            f"Input layout changed since last run (existing={existing_layout}, current={current.get('layout')}); refusing automatic resume.",
+            step="resume",
+        )
 
     forced_phase: Optional[str] = None
     reasons: List[str] = []
@@ -777,9 +783,3 @@ def execute(args: argparse.Namespace) -> int:
         )
         print(f"ERROR: {e}", file=sys.stderr)
         return 1
-    existing_layout = existing.get("layout", LAYOUT_PAIRED)
-    if existing_layout != current.get("layout"):
-        raise PipelineError(
-            f"Input layout changed since last run (existing={existing_layout}, current={current.get('layout')}); refusing automatic resume.",
-            step="resume",
-        )

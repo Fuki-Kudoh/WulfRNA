@@ -94,7 +94,7 @@ wulfrna run <workdir> --reference <reference_dir> --stranded reverse --threads 4
 ```
 
 Notes:
-- For dry-run to pass, required binaries must be in `PATH`, references must be complete for the selected quantifier, and `<workdir>/fastq` must contain at least one valid R1/R2 pair.
+- For dry-run to pass, required binaries must be in `PATH`, references must be complete for the selected quantifier, and `<workdir>/fastq` must contain valid FASTQ inputs for the selected layout (`paired_end` or `single_end`).
 - Single-end examples:
   - Salmon: `wulfrna run WORKDIR --reference REFDIR --stranded reverse --threads 4 --single-end --dry-run`
   - kallisto: `wulfrna run WORKDIR --reference REFDIR --stranded reverse --threads 4 --single-end --quantifier kallisto --fragment-length 200 --fragment-sd 20 --dry-run`
