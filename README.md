@@ -101,7 +101,40 @@ Notes:
   - Salmon: `wulfrna run WORKDIR --reference REFDIR --stranded reverse --threads 4 --single-end --dry-run`
   - kallisto: `wulfrna run WORKDIR --reference REFDIR --stranded reverse --threads 4 --single-end --quantifier kallisto --fragment-length 200 --fragment-sd 20 --dry-run`
 
-## 6) Main outputs and status markers
+
+## 6) Progress output
+
+WulfRNA writes plain, line-based progress messages to stderr and appends the same messages to `WORKDIR/logs/global.log`. This makes long runs easier to monitor from tmux, SSH sessions, schedulers, or redirected terminal output without opening individual step logs.
+
+Example CLI output:
+
+```text
+[WulfRNA] run summary
+[WulfRNA]   samples: 2 (sampleA, sampleB)
+[WulfRNA]   sample sampleA R1: /data/run/fastq/sampleA_R1.fastq.gz
+[WulfRNA]   sample sampleA R2: /data/run/fastq/sampleA_R2.fastq.gz
+[WulfRNA]   genome name: hg38
+[WulfRNA]   reference: /refs/hg38
+[WulfRNA]   strandedness: reverse
+[WulfRNA]   quantifier: salmon
+[WulfRNA]   threads: 16
+[WulfRNA]   workdir: /data/run
+[WulfRNA]   outdir: /data/run
+[WulfRNA] phase 1/6 fastqc_raw: run
+[WulfRNA] phase 1/6 fastqc_raw: sample 1/2 sampleA: fastqc
+[WulfRNA] phase 1/6 fastqc_raw: sample 2/2 sampleB: fastqc
+[WulfRNA] phase 1/6 fastqc_raw: done in 42.8s (1/6 complete, 16.7%)
+[WulfRNA] phase 2/6 cutadapt: already complete, skipping (2/6 complete, 33.3%)
+[WulfRNA] final summary
+[WulfRNA]   total phases: 6
+[WulfRNA]   completed phases: 6
+[WulfRNA]   incomplete phases: 0
+[WulfRNA]   final pipeline.status: SUCCESS
+[WulfRNA]   status directory: /data/run/status
+[WulfRNA]   logs directory: /data/run/logs
+```
+
+## 7) Main outputs and status markers
 
 Expected primary outputs on full success:
 - `abundance/gene_expected_counts.tsv`
@@ -120,7 +153,7 @@ Status files in `WORKDIR/status/`:
 - phase checkpoint markers: `status/steps/<phase>.done` for each completed phase
 - run compatibility manifest: `status/manifest.json`
 
-## 7) Automatic resume behavior
+## 8) Automatic resume behavior
 
 By default, `wulfrna run ...` automatically resumes at the **phase level** (not sample-level).
 
