@@ -159,3 +159,37 @@ Example:
 ```bash
 wulfrna run WORKDIR --reference REFDIR --stranded reverse --threads 16 --force-from aggregate
 ```
+
+## 8) Progress output
+
+WulfRNA prints plain line-based progress messages to stderr and appends the same messages to `logs/global.log`, so long runs can be monitored directly in tmux, SSH sessions, or redirected CLI logs without opening per-step log files.
+
+Example output:
+
+```text
+[WulfRNA] run summary:
+[WulfRNA]   samples: 2 (sampleA, sampleB)
+[WulfRNA]   input layout: paired_end
+[WulfRNA]   input sampleA: R1=/work/fastq/sampleA_R1.fastq.gz R2=/work/fastq/sampleA_R2.fastq.gz
+[WulfRNA]   genome: GRCh38
+[WulfRNA]   reference: /refs/GRCh38
+[WulfRNA]   strandedness: reverse
+[WulfRNA]   quantifier: salmon
+[WulfRNA]   threads: 16
+[WulfRNA]   workdir: /work
+[WulfRNA]   outdir: /work
+[WulfRNA] phase fastqc_raw: running
+[WulfRNA] sample 1/2 sampleA: fastqc_raw
+[WulfRNA] sample 2/2 sampleB: fastqc_raw
+[WulfRNA] phase fastqc_raw: done
+[WulfRNA] phase cutadapt: already complete, skipping
+[WulfRNA] final summary:
+[WulfRNA]   total samples: 2
+[WulfRNA]   completed samples: 2
+[WulfRNA]   incomplete samples: 0
+[WulfRNA]   final pipeline.status: SUCCESS
+[WulfRNA]   status directory: /work/status
+[WulfRNA]   logs directory: /work/logs
+```
+
+No dynamic terminal progress bar is used; progress is emitted as stable log lines.

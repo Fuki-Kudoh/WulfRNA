@@ -34,6 +34,15 @@ class PipelineError(Exception):
         self.sample = sample
 
 
+def progress_msg(workdir: Path, message: str) -> None:
+    formatted = f"[WulfRNA] {message}"
+    print(formatted, file=sys.stderr)
+    global_log = workdir / "logs" / "global.log"
+    global_log.parent.mkdir(parents=True, exist_ok=True)
+    with global_log.open("a", encoding="utf-8") as log:
+        log.write(formatted + "\n")
+
+
 def run_cmd(cmd: List[str], log_path: Path, step: str, sample: Optional[str] = None) -> None:
     log_path.parent.mkdir(parents=True, exist_ok=True)
     with log_path.open("w", encoding="utf-8") as log:
@@ -624,13 +633,29 @@ def execute(args: argparse.Namespace) -> int:
             },
             "tx2gene_fingerprint": fingerprint_file(refs["tx2gene"]),
         }
+        progress_msg(workdir, "run summary:")
+        progress_msg(workdir, f"  samples: {len(samples)} ({', '.join(sample.sample_id for sample in samples)})")
+        progress_msg(workdir, f"  input layout: {layout}")
+        for sample in samples:
+            if layout == LAYOUT_SINGLE:
+                progress_msg(workdir, f"  input {sample.sample_id}: R1={sample.r1}")
+            else:
+                progress_msg(workdir, f"  input {sample.sample_id}: R1={sample.r1} R2={sample.r2}")
+        progress_msg(workdir, f"  genome: {args.genome or '(reference root)'}")
+        progress_msg(workdir, f"  reference: {reference_dir}")
+        progress_msg(workdir, f"  strandedness: {args.stranded}")
+        progress_msg(workdir, f"  quantifier: {args.quantifier}")
+        progress_msg(workdir, f"  threads: {args.threads}")
+        progress_msg(workdir, f"  workdir: {workdir}")
+        progress_msg(workdir, f"  outdir: {workdir}")
+
         existing_manifest = load_manifest(workdir)
         auto_force_from: Optional[str] = None
         manifest_reasons: List[str] = []
         if existing_manifest is not None:
             auto_force_from, manifest_reasons = compare_manifest(existing_manifest, manifest)
             if auto_force_from is not None:
-                print(f"[force] {auto_force_from} (manifest: {', '.join(manifest_reasons)})")
+                progress_msg(workdir, f"force from {auto_force_from} (manifest: {', '.join(manifest_reasons)})")
         write_manifest(workdir, manifest)
 
         if args.dry_run:
@@ -647,6 +672,13 @@ def execute(args: argparse.Namespace) -> int:
                 0,
                 0,
             )
+            progress_msg(workdir, "final summary:")
+            progress_msg(workdir, f"  total samples: {len(samples)}")
+            progress_msg(workdir, "  completed samples: 0")
+            progress_msg(workdir, f"  incomplete samples: {len(samples)}")
+            progress_msg(workdir, "  final pipeline.status: DRY_RUN_OK")
+            progress_msg(workdir, f"  status directory: {status_dir}")
+            progress_msg(workdir, f"  logs directory: {workdir / 'logs'}")
             return 0
 
         effective_force_from = args.force_from
@@ -659,17 +691,18 @@ def execute(args: argparse.Namespace) -> int:
         for phase in PHASES:
             phase_should_run = should_run_phase(workdir, phase, samples, args.quantifier, layout, args.no_resume, effective_force_from)
             if not phase_should_run:
-                print(f"[skip] {phase}")
+                progress_msg(workdir, f"phase {phase}: already complete, skipping")
                 continue
             if args.no_resume:
-                print(f"[resume disabled] {phase}")
+                progress_msg(workdir, f"phase {phase}: running (resume disabled)")
             elif effective_force_from is not None and phase_index(phase) >= phase_index(effective_force_from):
-                print(f"[force] {phase}")
+                progress_msg(workdir, f"phase {phase}: running (forced)")
             else:
-                print(f"[run] {phase}")
+                progress_msg(workdir, f"phase {phase}: running")
 
             if phase == "fastqc_raw":
-                for sample in samples:
+                for sample_idx, sample in enumerate(samples, start=1):
+                    progress_msg(workdir, f"sample {sample_idx}/{len(samples)} {sample.sample_id}: fastqc_raw")
                     fastqs = [sample.r1] if layout == LAYOUT_SINGLE else [sample.r1, sample.r2]
                     run_cmd(
                         ["fastqc", "-t", str(max(1, args.threads // 2)), "-o", str(workdir / "qc/fastqc_raw"), *(str(fq) for fq in fastqs if fq is not None)],
@@ -678,7 +711,8 @@ def execute(args: argparse.Namespace) -> int:
                         sample=sample.sample_id,
                     )
             elif phase == "cutadapt":
-                for sample in samples:
+                for sample_idx, sample in enumerate(samples, start=1):
+                    progress_msg(workdir, f"sample {sample_idx}/{len(samples)} {sample.sample_id}: cutadapt")
                     cmd = ["cutadapt", "-j", str(max(1, args.threads // 2))]
                     if layout == LAYOUT_SINGLE:
                         cmd.extend(["-o", str(workdir / "trimmed" / f"{sample.sample_id}.trimmed.fastq.gz")])
@@ -689,7 +723,8 @@ def execute(args: argparse.Namespace) -> int:
                         cmd.append(str(sample.r2))
                     run_cmd(cmd, workdir / "logs/steps" / f"{sample.sample_id}.cutadapt.log", step="cutadapt", sample=sample.sample_id)
             elif phase == "fastqc_trimmed":
-                for sample in samples:
+                for sample_idx, sample in enumerate(samples, start=1):
+                    progress_msg(workdir, f"sample {sample_idx}/{len(samples)} {sample.sample_id}: fastqc_trimmed")
                     trimmed_fastqs = [workdir / "trimmed" / f"{sample.sample_id}.trimmed.fastq.gz"] if layout == LAYOUT_SINGLE else [workdir / "trimmed" / f"{sample.sample_id}_R1.trimmed.fastq.gz", workdir / "trimmed" / f"{sample.sample_id}_R2.trimmed.fastq.gz"]
                     run_cmd(
                         ["fastqc", "-t", str(max(1, args.threads // 2)), "-o", str(workdir / "qc/fastqc_trimmed"), *(str(fq) for fq in trimmed_fastqs)],
@@ -698,7 +733,8 @@ def execute(args: argparse.Namespace) -> int:
                         sample=sample.sample_id,
                     )
             elif phase == "quant":
-                for sample in samples:
+                for sample_idx, sample in enumerate(samples, start=1):
+                    progress_msg(workdir, f"sample {sample_idx}/{len(samples)} {sample.sample_id}: {args.quantifier}_quant")
                     if args.quantifier == "salmon":
                         quant_map[sample.sample_id] = run_salmon_quant(workdir, sample, refs, args.threads, args.stranded, layout)
                     else:
@@ -707,6 +743,7 @@ def execute(args: argparse.Namespace) -> int:
                         )
                 completed_samples = len(samples)
             elif phase == "aggregate":
+                progress_msg(workdir, "phase aggregate: tx2gene")
                 if not quant_map:
                     for sample in samples:
                         if args.quantifier == "salmon":
@@ -723,6 +760,7 @@ def execute(args: argparse.Namespace) -> int:
                     args.min_mapping_rate,
                 )
             elif phase == "multiqc":
+                progress_msg(workdir, "phase multiqc: report")
                 run_cmd(
                     ["multiqc", str(workdir), "-o", str(workdir / "multiqc")],
                     workdir / "logs/steps" / "multiqc.log",
@@ -735,7 +773,7 @@ def execute(args: argparse.Namespace) -> int:
             if not outputs_exist(phase_outputs(workdir, phase, samples, args.quantifier, layout)):
                 raise PipelineError(f"Expected outputs missing after phase: {phase}", step=phase)
             mark_phase_done(workdir, phase)
-            print(f"[done] {phase}")
+            progress_msg(workdir, f"phase {phase}: done")
 
         required_outputs = [
             workdir / "abundance/gene_expected_counts.tsv",
@@ -745,6 +783,7 @@ def execute(args: argparse.Namespace) -> int:
         for path in required_outputs:
             if not path.exists():
                 raise PipelineError(f"Required output missing: {path}", step="final_validation")
+        completed_samples = len(samples)
 
         (status_dir / "SUCCESS").write_text(now_iso() + "\n", encoding="utf-8")
         (status_dir / "finished_at.txt").write_text(now_iso() + "\n", encoding="utf-8")
@@ -761,6 +800,13 @@ def execute(args: argparse.Namespace) -> int:
             completed_samples,
             0,
         )
+        progress_msg(workdir, "final summary:")
+        progress_msg(workdir, f"  total samples: {len(samples)}")
+        progress_msg(workdir, f"  completed samples: {completed_samples}")
+        progress_msg(workdir, f"  incomplete samples: {max(0, len(samples) - completed_samples)}")
+        progress_msg(workdir, "  final pipeline.status: SUCCESS")
+        progress_msg(workdir, f"  status directory: {status_dir}")
+        progress_msg(workdir, f"  logs directory: {workdir / 'logs'}")
         return 0
 
     except PipelineError as e:
@@ -781,5 +827,12 @@ def execute(args: argparse.Namespace) -> int:
             completed_samples,
             max(0, len(samples) - completed_samples),
         )
-        print(f"ERROR: {e}", file=sys.stderr)
+        progress_msg(workdir, "final summary:")
+        progress_msg(workdir, f"  total samples: {len(samples)}")
+        progress_msg(workdir, f"  completed samples: {completed_samples}")
+        progress_msg(workdir, f"  incomplete samples: {max(0, len(samples) - completed_samples)}")
+        progress_msg(workdir, "  final pipeline.status: FAILED")
+        progress_msg(workdir, f"  status directory: {status_dir}")
+        progress_msg(workdir, f"  logs directory: {workdir / 'logs'}")
+        progress_msg(workdir, f"ERROR: {e}")
         return 1
