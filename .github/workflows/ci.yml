@@ -1,0 +1,74 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ['3.10', '3.11']
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install package
+        run: pip install -e .
+
+      - name: Compile package
+        run: python -m compileall src/wulfrna
+
+      - name: CLI help
+        run: |
+          wulfrna --help
+          wulfrna run --help
+
+      - name: Parser smoke tests
+        run: |
+          python - <<'PY'
+          from wulfrna.cli import parse_args
+
+          base = [
+              'WORKDIR',
+              '--reference', 'REFDIR',
+              '--stranded', 'reverse',
+              '--threads', '4',
+          ]
+
+          paired = parse_args(base)
+          assert paired.command == 'run'
+          assert paired.quantifier == 'salmon'
+          assert paired.single_end is False
+
+          single_salmon = parse_args([*base, '--single-end', '--quantifier', 'salmon'])
+          assert single_salmon.single_end is True
+          assert single_salmon.quantifier == 'salmon'
+
+          try:
+              parse_args([*base, '--single-end', '--quantifier', 'kallisto'])
+          except SystemExit as exc:
+              assert exc.code == 2
+          else:
+              raise AssertionError('single-end kallisto requires fragment length and SD')
+
+          single_kallisto = parse_args([
+              *base,
+              '--SE',
+              '--quantifier', 'kallisto',
+              '--fragment-length', '200',
+              '--fragment-sd', '20',
+          ])
+          assert single_kallisto.single_end is True
+          assert single_kallisto.fragment_length == 200
+          assert single_kallisto.fragment_sd == 20
+          PY

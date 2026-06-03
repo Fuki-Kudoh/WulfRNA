@@ -9,6 +9,8 @@ Current outputs:
 
 Pipeline steps: FastQC (raw) → Cutadapt → FastQC (trimmed) → transcript quantification (Salmon or kallisto) → gene-level aggregation via `combined_tx2gene.tsv` → MultiQC.
 
+Public-readiness note: WulfRNA v0.1.0 is an MVP/lightweight single-server runner intended for local or HPC workstation use. External analysis binaries must be installed separately, and WulfRNA is not intended to replace full workflow managers such as Nextflow or Snakemake.
+
 ## 1) Prerequisites
 
 WulfRNA does **not** install analysis binaries for you. They must already be installed and visible in `PATH` at runtime.

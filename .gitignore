@@ -1,0 +1,23 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+build/
+dist/
+*.egg-info/
+
+# WulfRNA runtime outputs
+fastq/
+trimmed/
+qc/
+abundance/
+multiqc/
+logs/
+metadata/
+status/
+samples.tsv
