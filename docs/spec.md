@@ -1,21 +1,35 @@
 # WulfRNA MVP Spec
 
 ## Scope
-WulfRNA is a single-server paired-end bulk RNA-seq pipeline exposed as a packaged CLI.
+WulfRNA is a lightweight single-server bulk RNA-seq pipeline exposed as a packaged CLI.
+Paired-end FASTQ input is the default, and single-end FASTQ input is supported with `--single-end` / `--SE`.
 
 ## CLI
 Primary command:
 
 ```bash
-wulfrna run WORKDIR --reference REFDIR --stranded {none|forward|reverse} --threads N [--quantifier {salmon|kallisto}] [--dry-run] [--genome NAME]
+wulfrna run WORKDIR --reference REFDIR --stranded {none|forward|reverse} --threads N [--quantifier {salmon|kallisto}] [--single-end|--SE] [--fragment-length FLOAT] [--fragment-sd FLOAT] [--dry-run] [--genome NAME]
 ```
 
-- `WORKDIR` must contain `fastq/` with `*_R1.fastq.gz` + matching `*_R2.fastq.gz`.
+- `WORKDIR` must contain `fastq/` using the selected input layout.
 - `--reference` points to a reference root.
 - `--genome` (optional) resolves references under `<reference>/<genome>/`.
-- `--quantifier` defaults to `salmon` and selects transcript quant backend.
+- `--quantifier` defaults to `salmon` and selects the transcript quantification backend.
+- `--single-end` / `--SE` enables single-end input; paired-end is the default.
+- `--fragment-length` and `--fragment-sd` are required only for single-end kallisto runs and must be positive.
 - `--no-resume` disables automatic phase-level resume.
 - `--force-from` forces rerun from one phase onward (`fastqc_raw`, `cutadapt`, `fastqc_trimmed`, `quant`, `aggregate`, `multiqc`).
+
+## Required input layout
+`WORKDIR/fastq/` must contain one of these layouts:
+
+Paired-end default:
+- `sample_id_R1.fastq.gz`
+- `sample_id_R2.fastq.gz`
+
+Single-end (`--single-end` / `--SE`):
+- `sample_id.fastq.gz` or `sample_id_R1.fastq.gz`
+- any `*_R2.fastq.gz` file is rejected in single-end mode.
 
 ## Required external tools
 All must be in `PATH`:
@@ -36,7 +50,7 @@ kallisto backend:
 - `kallisto_index/combined_transcripts.kidx`
 
 ## Pipeline behavior
-1. Validate tools, references, and sample pairing.
+1. Validate tools, references, and FASTQ inputs for the selected layout.
 2. Record metadata (`samples.tsv`, run parameters, versions).
 3. If `--dry-run`, stop after validation and metadata/status writing.
 4. Otherwise run:
@@ -67,10 +81,12 @@ Resume is enabled by default. A phase is skipped only if:
 
 Machine-readable manifest:
 - `status/manifest.json`
-- Includes `workdir`, `reference_dir`, `quantifier`, `stranded`, `sample_ids`, reference files used, tx2gene fingerprint, `created_at`, `updated_at`.
+- Includes `workdir`, `reference_dir`, `quantifier`, `stranded`, `layout`, `sample_ids`, reference files used, tx2gene fingerprint, `created_at`, `updated_at`.
 
 Manifest compatibility rules:
 - sample set change => hard error (no silent resume),
+- missing `layout` in old manifests is treated as `paired_end`,
+- layout mismatch between existing and current manifest => hard error (prevents silent paired-end/single-end mixing),
 - quantifier/reference_dir/stranded change => rerun quant and downstream,
 - `combined_tx2gene.tsv` fingerprint change => reuse quant, rerun aggregate + multiqc,
 - threads-only changes are resumable.
@@ -86,6 +102,7 @@ Primary outputs:
 - `abundance/gene_expected_counts.tsv`
 - `abundance/gene_tpm.tsv`
 - `multiqc/multiqc_report.html`
+- `logs/tx2gene_mapping_stats.tsv`
 
 Status markers (`WORKDIR/status/`):
 - `RUNNING` while active
