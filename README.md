@@ -1,4 +1,7 @@
 # WulfRNA
+<p align="center">
+  <img src="assets/wulfrna_logo.png" alt="WulfRNA logo" width="500">
+</p>
 
 WulfRNA is a packaged CLI for a focused bulk RNA-seq workflow on paired-end (default) or single-end FASTQ input.
 
