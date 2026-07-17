@@ -6,13 +6,17 @@
 WulfRNA is a packaged CLI for a focused bulk RNA-seq workflow on paired-end (default) or single-end FASTQ input.
 
 Current outputs:
-- gene-level expected counts as floating-point values (aggregated from transcript quantification)
-- gene-level TPM (aggregated from transcript quantification)
+- gene-level expected counts and TPM from Salmon or kallisto
+- optional coordinate-sorted STAR BAM and BAI
+- STAR splice-junction and gene-count outputs
 - final MultiQC report
 
-Pipeline steps: FastQC (raw) → Cutadapt → FastQC (trimmed) → transcript quantification (Salmon or kallisto) → gene-level aggregation via `combined_tx2gene.tsv` → MultiQC.
+Pipeline steps: FastQC (raw) → Cutadapt → FastQC (trimmed) →
+optional STAR alignment → transcript quantification (Salmon or kallisto) →
+gene-level aggregation → MultiQC.
 
-Public-readiness note: WulfRNA v0.1.0 is an MVP/lightweight single-server runner intended for local or HPC workstation use. External analysis binaries must be installed separately, and WulfRNA is not intended to replace full workflow managers such as Nextflow or Snakemake.
+Public-readiness note: WulfRNA v0.2.0 is a lightweight single-server
+bulk RNA-seq runner intended for local or HPC workstation use.
 
 ## 1) Prerequisites
 
