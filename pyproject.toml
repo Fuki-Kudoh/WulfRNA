@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "wulfrna"
 version = "0.2.1"
-description = "WulfRNA bulk RNA-seq MVP pipeline"
+description = "A lightweight command-line pipeline for bulk RNA-seq preprocessing, transcript quantification, gene-level aggregation, quality control, and optional STAR alignment"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
