@@ -29,7 +29,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--aligner",
         choices=["none", "star"],
         default="none",
-        help="Optional alignment backend; 'star' validates STAR reference resources but alignment execution is not implemented yet",
+        help="Optional alignment backend; 'star' runs STAR alignment and writes isolated outputs under align/star/<sample>/",
     )
     run_parser.add_argument("--single-end", "--SE", dest="single_end", action="store_true", help="Use single-end FASTQ input layout")
     run_parser.add_argument("--fragment-length", type=float, help="Single-end fragment length for kallisto")

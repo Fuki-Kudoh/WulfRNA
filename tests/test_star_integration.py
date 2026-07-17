@@ -88,6 +88,9 @@ outdir.mkdir(parents=True, exist_ok=True)
 from pathlib import Path
 import sys
 args = sys.argv[1:]
+if '--version' in args:
+    print('STAR 2.7.fake')
+    raise SystemExit(0)
 prefix = Path(args[args.index('--outFileNamePrefix') + 1])
 prefix.mkdir(parents=True, exist_ok=True)
 for name in ['Aligned.sortedByCoord.out.bam', 'SJ.out.tab', 'ReadsPerGene.out.tab', 'Log.final.out']:
@@ -99,6 +102,9 @@ for name in ['Aligned.sortedByCoord.out.bam', 'SJ.out.tab', 'ReadsPerGene.out.ta
             r"""#!/usr/bin/env python3
 from pathlib import Path
 import sys
+if '--version' in sys.argv[1:]:
+    print('samtools 1.fake')
+    raise SystemExit(0)
 bam = Path(sys.argv[2])
 Path(str(bam) + '.bai').write_text('bai\n', encoding='utf-8')
 """,
@@ -163,6 +169,14 @@ def assert_star_outputs(workdir: Path) -> None:
         assert (star_dir / name).stat().st_size > 0
     assert (workdir / "abundance" / "gene_expected_counts.tsv").stat().st_size > 0
     assert (workdir / "abundance" / "gene_tpm.tsv").stat().st_size > 0
+
+    star_log = (workdir / "logs" / "steps" / "sample.star.log").read_text(encoding="utf-8")
+    assert "--twopassMode Basic" in star_log
+    assert "--outSAMattributes NH HI AS nM MD" in star_log
+    assert "--outSAMtype BAM SortedByCoordinate" in star_log
+    versions = (workdir / "metadata" / "versions.txt").read_text(encoding="utf-8")
+    assert "STAR: STAR 2.7.fake" in versions
+    assert "samtools: samtools 1.fake" in versions
 
 
 def test_star_alignment_outputs_for_paired_end(monkeypatch, tmp_path):

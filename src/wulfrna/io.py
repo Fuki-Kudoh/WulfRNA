@@ -33,6 +33,8 @@ def capture_versions_file(out: Path) -> None:
             "salmon": ["salmon", "--version"],
             "kallisto": ["kallisto", "version"],
             "multiqc": ["multiqc", "--version"],
+            "STAR": ["STAR", "--version"],
+            "samtools": ["samtools", "--version"],
         }
         for name, cmd in version_cmds.items():
             if shutil.which(cmd[0]) is None:

@@ -3,6 +3,8 @@ import pytest
 from wulfrna.pipeline import (
     PipelineError,
     STAR_INDEX_REQUIRED_FILES,
+    compare_manifest,
+    fingerprint_star_index,
     validate_reference,
     validate_star_index,
 )
@@ -121,3 +123,29 @@ def test_validate_reference_rejects_unknown_aligner(tmp_path):
 
     assert exc.value.step == "reference_check"
     assert str(exc.value) == "Unsupported aligner: hisat2"
+
+
+def test_compare_manifest_forces_align_when_star_index_content_changes(tmp_path):
+    ref = make_salmon_reference(tmp_path)
+    star_index = make_complete_star_index(ref)
+    old_fingerprint = fingerprint_star_index(star_index)
+    (star_index / "Genome").write_text("changed genome\n", encoding="utf-8")
+    new_fingerprint = fingerprint_star_index(star_index)
+
+    base_manifest = {
+        "sample_ids": ["sample"],
+        "layout": "paired_end",
+        "quantifier": "salmon",
+        "reference_dir": str(ref),
+        "stranded": "reverse",
+        "aligner": "star",
+        "reference_files": {"star_index": str(star_index)},
+        "tx2gene_fingerprint": {"sha256": "same"},
+    }
+    existing = {**base_manifest, "star_index_fingerprint": old_fingerprint}
+    current = {**base_manifest, "star_index_fingerprint": new_fingerprint}
+
+    forced_phase, reasons = compare_manifest(existing, current)
+
+    assert forced_phase == "align"
+    assert "star_index fingerprint changed" in reasons

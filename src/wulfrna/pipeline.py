@@ -531,6 +531,14 @@ def run_star_align(workdir: Path, sample: Sample, refs: Dict[str, Path], threads
         "--outSAMtype",
         "BAM",
         "SortedByCoordinate",
+        "--outSAMattributes",
+        "NH",
+        "HI",
+        "AS",
+        "nM",
+        "MD",
+        "--twopassMode",
+        "Basic",
         "--quantMode",
         "GeneCounts",
     ]
@@ -609,6 +617,16 @@ def fingerprint_file(path: Path) -> Dict[str, str]:
     return {"path": str(path), "size": str(stat.st_size), "mtime_ns": str(stat.st_mtime_ns), "sha256": h.hexdigest()}
 
 
+def fingerprint_star_index(star_index: Path) -> Dict[str, object]:
+    files = {name: fingerprint_file(star_index / name) for name in STAR_INDEX_REQUIRED_FILES}
+    combined = hashlib.sha256()
+    for name in STAR_INDEX_REQUIRED_FILES:
+        file_fp = files[name]
+        combined.update(name.encode("utf-8"))
+        combined.update(str(file_fp["sha256"]).encode("utf-8"))
+    return {"path": str(star_index), "sha256": combined.hexdigest(), "files": files}
+
+
 def load_manifest(workdir: Path) -> Optional[Dict[str, object]]:
     manifest_path = workdir / "status" / "manifest.json"
     if not manifest_path.exists():
@@ -667,6 +685,8 @@ def compare_manifest(existing: Dict[str, object], current: Dict[str, object]) ->
     if isinstance(existing_reference_files, dict) and isinstance(current_reference_files, dict):
         if existing_reference_files.get("star_index") != current_reference_files.get("star_index"):
             force_from("align", "star_index changed")
+    if existing.get("star_index_fingerprint") != current.get("star_index_fingerprint"):
+        force_from("align", "star_index fingerprint changed")
 
     old_fp = existing.get("tx2gene_fingerprint", {})
     new_fp = current.get("tx2gene_fingerprint", {})
@@ -733,6 +753,7 @@ def execute(args: argparse.Namespace) -> int:
                 **({"star_index": str(refs["star_index"])} if args.aligner == "star" else {}),
             },
             "tx2gene_fingerprint": fingerprint_file(refs["tx2gene"]),
+            **({"star_index_fingerprint": fingerprint_star_index(refs["star_index"])} if args.aligner == "star" else {}),
         }
         existing_manifest = load_manifest(workdir)
         auto_force_from: Optional[str] = None
