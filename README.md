@@ -3,6 +3,8 @@
   <img src="assets/wulfrna_logo.png" alt="WulfRNA logo" width="500">
 </p>
 
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.21409117.svg)](https://doi.org/10.5281/zenodo.21409117)
+
 WulfRNA is a packaged CLI for a focused bulk RNA-seq workflow on paired-end (default) or single-end FASTQ input.
 
 Current outputs:
@@ -181,3 +183,12 @@ Example:
 ```bash
 wulfrna run WORKDIR --reference REFDIR --stranded reverse --threads 16 --force-from aggregate
 ```
+
+## 8) Citation
+
+If you use WulfRNA in your research, please cite:
+
+> Kudoh, F. (2026). WulfRNA (Version 0.2.1) [Computer software].
+> Zenodo. https://doi.org/10.5281/zenodo.21409117
+
+Citation metadata is also available in `CITATION.cff`.
