@@ -38,7 +38,7 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser.add_argument("--no-resume", action="store_true", help="Disable automatic phase-level resume and rerun all phases")
     run_parser.add_argument(
         "--force-from",
-        choices=["fastqc_raw", "cutadapt", "fastqc_trimmed", "quant", "aggregate", "multiqc"],
+        choices=["fastqc_raw", "cutadapt", "fastqc_trimmed", "align", "quant", "aggregate", "multiqc"],
         help="Force rerun from the selected phase onward",
     )
 

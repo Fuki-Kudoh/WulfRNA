@@ -15,7 +15,7 @@ from typing import Dict, List, Optional, Tuple
 
 from .io import capture_versions_file, now_iso
 
-PHASES = ["fastqc_raw", "cutadapt", "fastqc_trimmed", "quant", "aggregate", "multiqc"]
+PHASES = ["fastqc_raw", "cutadapt", "fastqc_trimmed", "align", "quant", "aggregate", "multiqc"]
 LAYOUT_PAIRED = "paired_end"
 LAYOUT_SINGLE = "single_end"
 
@@ -446,6 +446,8 @@ def ensure_dirs(workdir: Path) -> None:
         "qc/fastqc_trimmed",
         "qc/cutadapt",
         "abundance",
+        "align",
+        "align/star",
         "abundance/salmon",
         "abundance/kallisto",
         "multiqc",
@@ -457,6 +459,12 @@ def ensure_dirs(workdir: Path) -> None:
     ]
     for d in required:
         (workdir / d).mkdir(parents=True, exist_ok=True)
+
+
+def selected_phases(aligner: str) -> List[str]:
+    if aligner == "star":
+        return PHASES
+    return [phase for phase in PHASES if phase != "align"]
 
 
 def phase_index(phase: str) -> int:
@@ -485,6 +493,61 @@ def fastqc_prefix(fastq_path: Path) -> str:
     return fastq_path.stem
 
 
+def star_sample_outputs(workdir: Path, sample: Sample) -> List[Path]:
+    sample_dir = workdir / "align" / "star" / sample.sample_id
+    bam = sample_dir / "Aligned.sortedByCoord.out.bam"
+    return [
+        bam,
+        sample_dir / "Aligned.sortedByCoord.out.bam.bai",
+        sample_dir / "SJ.out.tab",
+        sample_dir / "ReadsPerGene.out.tab",
+        sample_dir / "Log.final.out",
+    ]
+
+
+def run_star_align(workdir: Path, sample: Sample, refs: Dict[str, Path], threads: int, layout: str) -> None:
+    sample_dir = workdir / "align" / "star" / sample.sample_id
+    sample_dir.mkdir(parents=True, exist_ok=True)
+    if layout == LAYOUT_SINGLE:
+        read_files = [workdir / "trimmed" / f"{sample.sample_id}.trimmed.fastq.gz"]
+    else:
+        read_files = [
+            workdir / "trimmed" / f"{sample.sample_id}_R1.trimmed.fastq.gz",
+            workdir / "trimmed" / f"{sample.sample_id}_R2.trimmed.fastq.gz",
+        ]
+
+    star_cmd = [
+        "STAR",
+        "--runThreadN",
+        str(threads),
+        "--genomeDir",
+        str(refs["star_index"]),
+        "--readFilesIn",
+        *(str(path) for path in read_files),
+        "--readFilesCommand",
+        "zcat",
+        "--outFileNamePrefix",
+        str(sample_dir) + "/",
+        "--outSAMtype",
+        "BAM",
+        "SortedByCoordinate",
+        "--quantMode",
+        "GeneCounts",
+    ]
+    run_cmd(star_cmd, workdir / "logs/steps" / f"{sample.sample_id}.star.log", step="align", sample=sample.sample_id)
+
+    bam = sample_dir / "Aligned.sortedByCoord.out.bam"
+    if not output_exists_nonempty(bam):
+        raise PipelineError(f"Missing STAR sorted BAM for sample {sample.sample_id}: {bam}", step="align", sample=sample.sample_id)
+
+    run_cmd(
+        ["samtools", "index", str(bam)],
+        workdir / "logs/steps" / f"{sample.sample_id}.samtools_index.log",
+        step="align",
+        sample=sample.sample_id,
+    )
+
+
 def phase_outputs(workdir: Path, phase: str, samples: List[Sample], quantifier: str, layout: str) -> List[Path]:
     outputs: List[Path] = []
     if phase == "fastqc_raw":
@@ -510,6 +573,9 @@ def phase_outputs(workdir: Path, phase: str, samples: List[Sample], quantifier: 
                 prefix = fastqc_prefix(fq)
                 outputs.append(outdir / f"{prefix}_fastqc.html")
                 outputs.append(outdir / f"{prefix}_fastqc.zip")
+    elif phase == "align":
+        for sample in samples:
+            outputs.extend(star_sample_outputs(workdir, sample))
     elif phase == "quant":
         if quantifier == "salmon":
             for sample in samples:
@@ -594,6 +660,13 @@ def compare_manifest(existing: Dict[str, object], current: Dict[str, object]) ->
         force_from("quant", "reference_dir changed")
     if existing.get("stranded") != current.get("stranded"):
         force_from("quant", "stranded changed")
+    if existing.get("aligner", "none") != current.get("aligner", "none"):
+        force_from("align", "aligner changed")
+    existing_reference_files = existing.get("reference_files", {})
+    current_reference_files = current.get("reference_files", {})
+    if isinstance(existing_reference_files, dict) and isinstance(current_reference_files, dict):
+        if existing_reference_files.get("star_index") != current_reference_files.get("star_index"):
+            force_from("align", "star_index changed")
 
     old_fp = existing.get("tx2gene_fingerprint", {})
     new_fp = current.get("tx2gene_fingerprint", {})
@@ -636,7 +709,8 @@ def execute(args: argparse.Namespace) -> int:
     try:
         base_tools = ["fastqc", "cutadapt", "multiqc"]
         quant_tool = "salmon" if args.quantifier == "salmon" else "kallisto"
-        check_tools(base_tools + [quant_tool])
+        align_tools = ["STAR", "samtools"] if args.aligner == "star" else []
+        check_tools(base_tools + [quant_tool, *align_tools])
 
         reference_dir = resolve_reference_dir(reference_root, args.genome)
         refs = validate_reference(reference_dir, args.quantifier, args.aligner)
@@ -692,7 +766,7 @@ def execute(args: argparse.Namespace) -> int:
             effective_force_from = auto_force_from
 
         quant_map: Dict[str, Path] = {}
-        for phase in PHASES:
+        for phase in selected_phases(args.aligner):
             phase_should_run = should_run_phase(workdir, phase, samples, args.quantifier, layout, args.no_resume, effective_force_from)
             if not phase_should_run:
                 print(f"[skip] {phase}")
@@ -733,6 +807,9 @@ def execute(args: argparse.Namespace) -> int:
                         step="fastqc_trimmed",
                         sample=sample.sample_id,
                     )
+            elif phase == "align":
+                for sample in samples:
+                    run_star_align(workdir, sample, refs, args.threads, layout)
             elif phase == "quant":
                 for sample in samples:
                     if args.quantifier == "salmon":
