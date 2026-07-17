@@ -3,6 +3,7 @@ message: "If you use WulfRNA in your research, please cite this software."
 title: "WulfRNA"
 type: software
 version: "0.2.1"
+doi: "10.5281/zenodo.21409117"
 date-released: "2026-07-17"
 authors:
   - family-names: "Kudoh"
