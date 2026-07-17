@@ -25,6 +25,7 @@ Required commands:
 - `cutadapt`
 - `multiqc`
 - `salmon` (default backend) or `kallisto` (optional backend, when selected)
+- `STAR` and `samtools` (optional, required only when `--aligner star` is selected)
 
 Useful standard utilities expected on Linux nodes:
 - `gzip`, `zcat`, `awk`, `sed`, `grep`, `sort`, `head`, `tail`
@@ -64,6 +65,7 @@ This installs the `wulfrna` command.
 - shared: `combined_tx2gene.tsv`
 - Salmon backend: `salmon_index/`
 - kallisto backend: `kallisto_index/combined_transcripts.kidx`
+- STAR aligner (when `--aligner star`): `star_index/` containing non-empty `Genome`, `SA`, `SAindex`, `genomeParameters.txt`, `chrName.txt`, `chrLength.txt`, and `chrNameLength.txt`
 
 ## 4) Run command
 
@@ -79,13 +81,14 @@ Arguments:
   - kallisto mapping: `none -> (unstranded default)`, `forward -> --fr-stranded`, `reverse -> --rf-stranded`
 - `--threads N` (required): total threads (`N >= 1`)
 - `--quantifier {salmon|kallisto}` (optional, default `salmon`)
+- `--aligner {none|star}` (optional, default `none`): run STAR alignment from trimmed FASTQs and write isolated alignment outputs under `align/star/<sample>/`; Salmon/kallisto quantification and abundance matrices are still produced normally
 - `--single-end`, `--SE` (optional): switch layout from `paired_end` to `single_end`
 - `--fragment-length FLOAT` and `--fragment-sd FLOAT` (single-end kallisto only; both required and must be `> 0`)
 - `--min-mapping-rate FLOAT` (optional, default `0.90`): minimum acceptable tx2gene transcript mapping rate per sample (`0.0-1.0`)
 - `--dry-run` (optional): validate tools/reference/inputs, write metadata/status, then exit
 - `--genome NAME` (optional): resolve references as `<reference>/<NAME>/...`
 - `--no-resume` (optional): disable phase-level resume and rerun all phases
-- `--force-from {fastqc_raw,cutadapt,fastqc_trimmed,quant,aggregate,multiqc}` (optional): force rerun from the selected phase onward
+- `--force-from {fastqc_raw,cutadapt,fastqc_trimmed,align,quant,aggregate,multiqc}` (optional): force rerun from the selected phase onward
 
 Backward-compatibility note: legacy invocation without explicit `run` is still accepted, but `wulfrna run ...` is the intended interface.
 
@@ -96,10 +99,11 @@ pip install -e .
 wulfrna --help
 wulfrna run <workdir> --reference <reference_dir> --stranded reverse --threads 4 --dry-run
 wulfrna run <workdir> --reference <reference_dir> --stranded reverse --threads 4 --quantifier kallisto --dry-run
+wulfrna run <workdir> --reference <reference_dir> --stranded reverse --threads 4 --aligner star --dry-run
 ```
 
 Notes:
-- For dry-run to pass, required binaries must be in `PATH`, references must be complete for the selected quantifier, and `<workdir>/fastq` must contain valid FASTQ inputs for the selected layout (`paired_end` or `single_end`).
+- For dry-run to pass, required binaries must be in `PATH`, references must be complete for the selected quantifier and optional aligner, and `<workdir>/fastq` must contain valid FASTQ inputs for the selected layout (`paired_end` or `single_end`).
 - Single-end examples:
   - Salmon: `wulfrna run WORKDIR --reference REFDIR --stranded reverse --threads 4 --single-end --dry-run`
   - kallisto: `wulfrna run WORKDIR --reference REFDIR --stranded reverse --threads 4 --single-end --quantifier kallisto --fragment-length 200 --fragment-sd 20 --dry-run`
@@ -111,6 +115,15 @@ Expected primary outputs on full success:
 - `abundance/gene_tpm.tsv`
 - `multiqc/multiqc_report.html`
 - `logs/tx2gene_mapping_stats.tsv`
+
+Additional outputs when `--aligner star` is selected (per sample):
+- `align/star/<sample>/Aligned.sortedByCoord.out.bam`
+- `align/star/<sample>/Aligned.sortedByCoord.out.bam.bai`
+- `align/star/<sample>/SJ.out.tab`
+- `align/star/<sample>/ReadsPerGene.out.tab`
+- `align/star/<sample>/Log.final.out`
+
+STAR outputs coexist with Salmon/kallisto outputs. STAR gene counts are not aggregated into `abundance/gene_expected_counts.tsv` or `abundance/gene_tpm.tsv`.
 
 Matrix behavior note:
 - Gene-level matrices include only genes observed in the transcript quantification input (unobserved zero-only genes are not emitted).
@@ -131,6 +144,7 @@ Phases:
 - `fastqc_raw`
 - `cutadapt`
 - `fastqc_trimmed`
+- `align` (only when `--aligner star`)
 - `quant`
 - `aggregate`
 - `multiqc`
@@ -144,6 +158,7 @@ Conservative compatibility rules:
 - If sample IDs changed: resume is blocked with an error.
 - If input layout changed (`paired_end` vs `single_end`): automatic resume is blocked with an error.
 - If `quantifier`, `reference_dir`, or `stranded` changed: `quant` and downstream phases rerun.
+- If `aligner` or STAR index content changed: `align` and downstream phases rerun when STAR alignment is enabled.
 - If `combined_tx2gene.tsv` fingerprint changed: `aggregate` and `multiqc` rerun.
 - If only thread count changed: resume is allowed.
 

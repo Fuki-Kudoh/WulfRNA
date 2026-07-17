@@ -16,6 +16,9 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Bio-Informatics",
 ]
 
+[project.optional-dependencies]
+test = ["pytest"]
+
 [project.scripts]
 wulfrna = "wulfrna.cli:main"
 

@@ -15,9 +15,20 @@ from typing import Dict, List, Optional, Tuple
 
 from .io import capture_versions_file, now_iso
 
-PHASES = ["fastqc_raw", "cutadapt", "fastqc_trimmed", "quant", "aggregate", "multiqc"]
+PHASES = ["fastqc_raw", "cutadapt", "fastqc_trimmed", "align", "quant", "aggregate", "multiqc"]
 LAYOUT_PAIRED = "paired_end"
 LAYOUT_SINGLE = "single_end"
+
+
+STAR_INDEX_REQUIRED_FILES = [
+    "Genome",
+    "SA",
+    "SAindex",
+    "genomeParameters.txt",
+    "chrName.txt",
+    "chrLength.txt",
+    "chrNameLength.txt",
+]
 
 
 @dataclass(frozen=True)
@@ -58,7 +69,7 @@ def resolve_reference_dir(reference_root: Path, genome: Optional[str]) -> Path:
     return reference_dir
 
 
-def validate_reference(reference_dir: Path, quantifier: str) -> Dict[str, Path]:
+def validate_reference(reference_dir: Path, quantifier: str, aligner: str = "none") -> Dict[str, Path]:
     tx2gene = reference_dir / "combined_tx2gene.tsv"
     missing: List[str] = []
 
@@ -79,10 +90,33 @@ def validate_reference(reference_dir: Path, quantifier: str) -> Dict[str, Path]:
     if not tx2gene.is_file():
         missing.append(str(tx2gene))
 
+    if aligner == "star":
+        refs["star_index"] = validate_star_index(reference_dir / "star_index")
+    elif aligner != "none":
+        raise PipelineError(f"Unsupported aligner: {aligner}", step="reference_check")
+
     if missing:
         raise PipelineError("Reference directory is missing required files: " + ", ".join(missing), step="reference_check")
 
     return refs
+
+
+def validate_star_index(star_index: Path) -> Path:
+    if not star_index.is_dir():
+        raise PipelineError(f"STAR index directory not found: {star_index}", step="reference_check")
+
+    missing_or_empty = [
+        str(star_index / name)
+        for name in STAR_INDEX_REQUIRED_FILES
+        if not (star_index / name).is_file() or (star_index / name).stat().st_size == 0
+    ]
+    if missing_or_empty:
+        raise PipelineError(
+            "STAR index is missing required non-empty files: " + ", ".join(missing_or_empty),
+            step="reference_check",
+        )
+
+    return star_index
 
 
 def detect_samples(workdir: Path, single_end: bool) -> Tuple[str, List[Sample]]:
@@ -412,6 +446,8 @@ def ensure_dirs(workdir: Path) -> None:
         "qc/fastqc_trimmed",
         "qc/cutadapt",
         "abundance",
+        "align",
+        "align/star",
         "abundance/salmon",
         "abundance/kallisto",
         "multiqc",
@@ -423,6 +459,12 @@ def ensure_dirs(workdir: Path) -> None:
     ]
     for d in required:
         (workdir / d).mkdir(parents=True, exist_ok=True)
+
+
+def selected_phases(aligner: str) -> List[str]:
+    if aligner == "star":
+        return PHASES
+    return [phase for phase in PHASES if phase != "align"]
 
 
 def phase_index(phase: str) -> int:
@@ -451,6 +493,69 @@ def fastqc_prefix(fastq_path: Path) -> str:
     return fastq_path.stem
 
 
+def star_sample_outputs(workdir: Path, sample: Sample) -> List[Path]:
+    sample_dir = workdir / "align" / "star" / sample.sample_id
+    bam = sample_dir / "Aligned.sortedByCoord.out.bam"
+    return [
+        bam,
+        sample_dir / "Aligned.sortedByCoord.out.bam.bai",
+        sample_dir / "SJ.out.tab",
+        sample_dir / "ReadsPerGene.out.tab",
+        sample_dir / "Log.final.out",
+    ]
+
+
+def run_star_align(workdir: Path, sample: Sample, refs: Dict[str, Path], threads: int, layout: str) -> None:
+    sample_dir = workdir / "align" / "star" / sample.sample_id
+    sample_dir.mkdir(parents=True, exist_ok=True)
+    if layout == LAYOUT_SINGLE:
+        read_files = [workdir / "trimmed" / f"{sample.sample_id}.trimmed.fastq.gz"]
+    else:
+        read_files = [
+            workdir / "trimmed" / f"{sample.sample_id}_R1.trimmed.fastq.gz",
+            workdir / "trimmed" / f"{sample.sample_id}_R2.trimmed.fastq.gz",
+        ]
+
+    star_cmd = [
+        "STAR",
+        "--runThreadN",
+        str(threads),
+        "--genomeDir",
+        str(refs["star_index"]),
+        "--readFilesIn",
+        *(str(path) for path in read_files),
+        "--readFilesCommand",
+        "zcat",
+        "--outFileNamePrefix",
+        str(sample_dir) + "/",
+        "--outSAMtype",
+        "BAM",
+        "SortedByCoordinate",
+        "--outSAMattributes",
+        "NH",
+        "HI",
+        "AS",
+        "nM",
+        "MD",
+        "--twopassMode",
+        "Basic",
+        "--quantMode",
+        "GeneCounts",
+    ]
+    run_cmd(star_cmd, workdir / "logs/steps" / f"{sample.sample_id}.star.log", step="align", sample=sample.sample_id)
+
+    bam = sample_dir / "Aligned.sortedByCoord.out.bam"
+    if not output_exists_nonempty(bam):
+        raise PipelineError(f"Missing STAR sorted BAM for sample {sample.sample_id}: {bam}", step="align", sample=sample.sample_id)
+
+    run_cmd(
+        ["samtools", "index", str(bam)],
+        workdir / "logs/steps" / f"{sample.sample_id}.samtools_index.log",
+        step="align",
+        sample=sample.sample_id,
+    )
+
+
 def phase_outputs(workdir: Path, phase: str, samples: List[Sample], quantifier: str, layout: str) -> List[Path]:
     outputs: List[Path] = []
     if phase == "fastqc_raw":
@@ -476,6 +581,9 @@ def phase_outputs(workdir: Path, phase: str, samples: List[Sample], quantifier: 
                 prefix = fastqc_prefix(fq)
                 outputs.append(outdir / f"{prefix}_fastqc.html")
                 outputs.append(outdir / f"{prefix}_fastqc.zip")
+    elif phase == "align":
+        for sample in samples:
+            outputs.extend(star_sample_outputs(workdir, sample))
     elif phase == "quant":
         if quantifier == "salmon":
             for sample in samples:
@@ -500,13 +608,27 @@ def is_phase_complete(workdir: Path, phase: str, samples: List[Sample], quantifi
     return step_done_file(workdir, phase).exists() and outputs_exist(phase_outputs(workdir, phase, samples, quantifier, layout))
 
 
-def fingerprint_file(path: Path) -> Dict[str, str]:
-    h = hashlib.sha256()
-    with path.open("rb") as f:
-        for chunk in iter(lambda: f.read(1024 * 1024), b""):
-            h.update(chunk)
+def fingerprint_file(path: Path, *, include_sha256: bool = True) -> Dict[str, str]:
     stat = path.stat()
-    return {"path": str(path), "size": str(stat.st_size), "mtime_ns": str(stat.st_mtime_ns), "sha256": h.hexdigest()}
+    fingerprint = {"path": str(path), "size": str(stat.st_size), "mtime_ns": str(stat.st_mtime_ns)}
+    if include_sha256:
+        h = hashlib.sha256()
+        with path.open("rb") as f:
+            for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                h.update(chunk)
+        fingerprint["sha256"] = h.hexdigest()
+    return fingerprint
+
+
+def fingerprint_star_index(star_index: Path) -> Dict[str, object]:
+    metadata_only_files = {"Genome", "SA", "SAindex"}
+    files = {
+        name: fingerprint_file(star_index / name, include_sha256=name not in metadata_only_files)
+        for name in STAR_INDEX_REQUIRED_FILES
+    }
+    combined_payload = {"path": str(star_index), "files": files}
+    combined = hashlib.sha256(json.dumps(combined_payload, sort_keys=True).encode("utf-8"))
+    return {"path": str(star_index), "sha256": combined.hexdigest(), "files": files}
 
 
 def load_manifest(workdir: Path) -> Optional[Dict[str, object]]:
@@ -560,6 +682,15 @@ def compare_manifest(existing: Dict[str, object], current: Dict[str, object]) ->
         force_from("quant", "reference_dir changed")
     if existing.get("stranded") != current.get("stranded"):
         force_from("quant", "stranded changed")
+    if existing.get("aligner", "none") != current.get("aligner", "none"):
+        force_from("align", "aligner changed")
+    existing_reference_files = existing.get("reference_files", {})
+    current_reference_files = current.get("reference_files", {})
+    if isinstance(existing_reference_files, dict) and isinstance(current_reference_files, dict):
+        if existing_reference_files.get("star_index") != current_reference_files.get("star_index"):
+            force_from("align", "star_index changed")
+    if existing.get("star_index_fingerprint") != current.get("star_index_fingerprint"):
+        force_from("align", "star_index fingerprint changed")
 
     old_fp = existing.get("tx2gene_fingerprint", {})
     new_fp = current.get("tx2gene_fingerprint", {})
@@ -602,10 +733,11 @@ def execute(args: argparse.Namespace) -> int:
     try:
         base_tools = ["fastqc", "cutadapt", "multiqc"]
         quant_tool = "salmon" if args.quantifier == "salmon" else "kallisto"
-        check_tools(base_tools + [quant_tool])
+        align_tools = ["STAR", "samtools"] if args.aligner == "star" else []
+        check_tools(base_tools + [quant_tool, *align_tools])
 
         reference_dir = resolve_reference_dir(reference_root, args.genome)
-        refs = validate_reference(reference_dir, args.quantifier)
+        refs = validate_reference(reference_dir, args.quantifier, args.aligner)
         layout, samples = detect_samples(workdir, args.single_end)
         tx2gene_map = parse_tx2gene(refs["tx2gene"])
         write_params(workdir, args)
@@ -616,13 +748,16 @@ def execute(args: argparse.Namespace) -> int:
             "reference_dir": str(reference_dir),
             "quantifier": args.quantifier,
             "stranded": args.stranded,
+            "aligner": args.aligner,
             "layout": layout,
             "sample_ids": [sample.sample_id for sample in samples],
             "reference_files": {
                 "index": str(refs["index"]),
                 "combined_tx2gene_tsv": str(refs["tx2gene"]),
+                **({"star_index": str(refs["star_index"])} if args.aligner == "star" else {}),
             },
             "tx2gene_fingerprint": fingerprint_file(refs["tx2gene"]),
+            **({"star_index_fingerprint": fingerprint_star_index(refs["star_index"])} if args.aligner == "star" else {}),
         }
         existing_manifest = load_manifest(workdir)
         auto_force_from: Optional[str] = None
@@ -656,7 +791,7 @@ def execute(args: argparse.Namespace) -> int:
             effective_force_from = auto_force_from
 
         quant_map: Dict[str, Path] = {}
-        for phase in PHASES:
+        for phase in selected_phases(args.aligner):
             phase_should_run = should_run_phase(workdir, phase, samples, args.quantifier, layout, args.no_resume, effective_force_from)
             if not phase_should_run:
                 print(f"[skip] {phase}")
@@ -697,6 +832,9 @@ def execute(args: argparse.Namespace) -> int:
                         step="fastqc_trimmed",
                         sample=sample.sample_id,
                     )
+            elif phase == "align":
+                for sample in samples:
+                    run_star_align(workdir, sample, refs, args.threads, layout)
             elif phase == "quant":
                 for sample in samples:
                     if args.quantifier == "salmon":

@@ -8,17 +8,18 @@ Paired-end FASTQ input is the default, and single-end FASTQ input is supported w
 Primary command:
 
 ```bash
-wulfrna run WORKDIR --reference REFDIR --stranded {none|forward|reverse} --threads N [--quantifier {salmon|kallisto}] [--single-end|--SE] [--fragment-length FLOAT] [--fragment-sd FLOAT] [--dry-run] [--genome NAME]
+wulfrna run WORKDIR --reference REFDIR --stranded {none|forward|reverse} --threads N [--quantifier {salmon|kallisto}] [--aligner {none|star}] [--single-end|--SE] [--fragment-length FLOAT] [--fragment-sd FLOAT] [--dry-run] [--genome NAME]
 ```
 
 - `WORKDIR` must contain `fastq/` using the selected input layout.
 - `--reference` points to a reference root.
 - `--genome` (optional) resolves references under `<reference>/<genome>/`.
 - `--quantifier` defaults to `salmon` and selects the transcript quantification backend.
+- `--aligner` defaults to `none`; `--aligner star` runs STAR from trimmed FASTQs and writes isolated outputs under `align/star/<sample>/` while preserving Salmon/kallisto quantification outputs.
 - `--single-end` / `--SE` enables single-end input; paired-end is the default.
 - `--fragment-length` and `--fragment-sd` are required only for single-end kallisto runs and must be positive.
 - `--no-resume` disables automatic phase-level resume.
-- `--force-from` forces rerun from one phase onward (`fastqc_raw`, `cutadapt`, `fastqc_trimmed`, `quant`, `aggregate`, `multiqc`).
+- `--force-from` forces rerun from one phase onward (`fastqc_raw`, `cutadapt`, `fastqc_trimmed`, `align`, `quant`, `aggregate`, `multiqc`).
 
 ## Required input layout
 `WORKDIR/fastq/` must contain one of these layouts:
@@ -38,6 +39,7 @@ All must be in `PATH`:
 - multiqc
 - salmon (if `--quantifier salmon`)
 - kallisto (if `--quantifier kallisto`)
+- STAR and samtools (if `--aligner star`)
 
 ## Required reference files (resolved reference directory)
 Shared:
@@ -49,6 +51,17 @@ Salmon backend:
 kallisto backend:
 - `kallisto_index/combined_transcripts.kidx`
 
+STAR aligner (`--aligner star`):
+- `star_index/Genome`
+- `star_index/SA`
+- `star_index/SAindex`
+- `star_index/genomeParameters.txt`
+- `star_index/chrName.txt`
+- `star_index/chrLength.txt`
+- `star_index/chrNameLength.txt`
+
+All required STAR index files must be non-empty.
+
 ## Pipeline behavior
 1. Validate tools, references, and FASTQ inputs for the selected layout.
 2. Record metadata (`samples.tsv`, run parameters, versions).
@@ -57,6 +70,7 @@ kallisto backend:
    - FastQC on raw FASTQ
    - Cutadapt trimming
    - FastQC on trimmed FASTQ
+   - STAR alignment per sample when `--aligner star` is selected
    - Transcript quantification per sample (`salmon quant` or `kallisto quant`)
    - Aggregate transcript-level estimates to gene-level using `combined_tx2gene.tsv`
    - MultiQC over the work directory
@@ -68,6 +82,7 @@ Completed phases write:
 - `status/steps/fastqc_raw.done`
 - `status/steps/cutadapt.done`
 - `status/steps/fastqc_trimmed.done`
+- `status/steps/align.done` (only when `--aligner star`)
 - `status/steps/quant.done`
 - `status/steps/aggregate.done`
 - `status/steps/multiqc.done`
@@ -81,13 +96,14 @@ Resume is enabled by default. A phase is skipped only if:
 
 Machine-readable manifest:
 - `status/manifest.json`
-- Includes `workdir`, `reference_dir`, `quantifier`, `stranded`, `layout`, `sample_ids`, reference files used, tx2gene fingerprint, `created_at`, `updated_at`.
+- Includes `workdir`, `reference_dir`, `quantifier`, `aligner`, `stranded`, `layout`, `sample_ids`, reference files used, tx2gene fingerprint, STAR index fingerprint when applicable, `created_at`, `updated_at`.
 
 Manifest compatibility rules:
 - sample set change => hard error (no silent resume),
 - missing `layout` in old manifests is treated as `paired_end`,
 - layout mismatch between existing and current manifest => hard error (prevents silent paired-end/single-end mixing),
 - quantifier/reference_dir/stranded change => rerun quant and downstream,
+- aligner or STAR index path/content change => rerun align and downstream when STAR alignment is enabled,
 - `combined_tx2gene.tsv` fingerprint change => reuse quant, rerun aggregate + multiqc,
 - threads-only changes are resumable.
 
@@ -103,6 +119,15 @@ Primary outputs:
 - `abundance/gene_tpm.tsv`
 - `multiqc/multiqc_report.html`
 - `logs/tx2gene_mapping_stats.tsv`
+
+STAR outputs when `--aligner star`:
+- `align/star/<sample>/Aligned.sortedByCoord.out.bam`
+- `align/star/<sample>/Aligned.sortedByCoord.out.bam.bai`
+- `align/star/<sample>/SJ.out.tab`
+- `align/star/<sample>/ReadsPerGene.out.tab`
+- `align/star/<sample>/Log.final.out`
+
+STAR outputs coexist with Salmon/kallisto outputs and do not replace or overwrite the gene-level abundance matrices.
 
 Status markers (`WORKDIR/status/`):
 - `RUNNING` while active

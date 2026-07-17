@@ -25,6 +25,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     run_parser.add_argument("--threads", required=True, type=int, help="Total threads")
     run_parser.add_argument("--quantifier", choices=["salmon", "kallisto"], default="salmon", help="Transcript quantification backend")
+    run_parser.add_argument(
+        "--aligner",
+        choices=["none", "star"],
+        default="none",
+        help="Optional alignment backend; 'star' runs STAR alignment and writes isolated outputs under align/star/<sample>/",
+    )
     run_parser.add_argument("--single-end", "--SE", dest="single_end", action="store_true", help="Use single-end FASTQ input layout")
     run_parser.add_argument("--fragment-length", type=float, help="Single-end fragment length for kallisto")
     run_parser.add_argument("--fragment-sd", type=float, help="Single-end fragment length standard deviation for kallisto")
@@ -32,7 +38,7 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser.add_argument("--no-resume", action="store_true", help="Disable automatic phase-level resume and rerun all phases")
     run_parser.add_argument(
         "--force-from",
-        choices=["fastqc_raw", "cutadapt", "fastqc_trimmed", "quant", "aggregate", "multiqc"],
+        choices=["fastqc_raw", "cutadapt", "fastqc_trimmed", "align", "quant", "aggregate", "multiqc"],
         help="Force rerun from the selected phase onward",
     )
 
