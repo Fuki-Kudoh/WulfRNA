@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.2.1] - 2026-07-17
+
+### Added
+
+- Added `CITATION.cff` with software citation metadata for GitHub and
+  Zenodo integration.
+
+### Changed
+
+- Updated package version to 0.2.1 for the citation-enabled archived
+  release.
+
 ## [0.2.0] - 2026-07-17
 
 ### Added

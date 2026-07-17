@@ -1,0 +1,29 @@
+cff-version: 1.2.0
+message: "If you use WulfRNA in your research, please cite this software."
+title: "WulfRNA"
+type: software
+version: "0.2.1"
+date-released: "2026-07-17"
+authors:
+  - family-names: "Kudoh"
+    given-names: "Fuki"
+    affiliation: "Tokyo Metropolitan Institute of Medical Science"
+    orcid: "https://orcid.org/0000-0001-8986-4216"
+abstract: >-
+  WulfRNA is a lightweight command-line pipeline for bulk RNA-seq
+  preprocessing, transcript quantification, gene-level aggregation,
+  quality control, and optional STAR genome alignment. It supports
+  paired-end and single-end FASTQ inputs, Salmon or kallisto
+  quantification, resumable execution, coordinate-sorted BAM output,
+  splice-junction output, and MultiQC reporting.
+keywords:
+  - RNA-seq
+  - bulk RNA-seq
+  - bioinformatics
+  - Salmon
+  - kallisto
+  - STAR
+  - transcriptomics
+license: "MIT"
+repository-code: "https://github.com/Fuki-Kudoh/WulfRNA"
+url: "https://github.com/Fuki-Kudoh/WulfRNA"
