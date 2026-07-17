@@ -17,7 +17,7 @@ Pipeline steps: FastQC (raw) → Cutadapt → FastQC (trimmed) →
 optional STAR alignment → transcript quantification (Salmon or kallisto) →
 gene-level aggregation → MultiQC.
 
-Public-readiness note: WulfRNA v0.2.0 is a lightweight single-server
+Public-readiness note: WulfRNA v0.2.1 is a lightweight single-server
 bulk RNA-seq runner intended for local or HPC workstation use.
 
 ## 1) Prerequisites
@@ -43,7 +43,7 @@ Use Python 3.10+ and a virtual environment:
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
-pip install -e .
+pip install .
 ```
 
 This installs the `wulfrna` command.
