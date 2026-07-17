@@ -129,7 +129,7 @@ def test_compare_manifest_forces_align_when_star_index_content_changes(tmp_path)
     ref = make_salmon_reference(tmp_path)
     star_index = make_complete_star_index(ref)
     old_fingerprint = fingerprint_star_index(star_index)
-    (star_index / "Genome").write_text("changed genome\n", encoding="utf-8")
+    (star_index / "chrName.txt").write_text("changed chr names\n", encoding="utf-8")
     new_fingerprint = fingerprint_star_index(star_index)
 
     base_manifest = {
@@ -149,3 +149,25 @@ def test_compare_manifest_forces_align_when_star_index_content_changes(tmp_path)
 
     assert forced_phase == "align"
     assert "star_index fingerprint changed" in reasons
+
+
+def test_fingerprint_star_index_does_not_hash_large_index_file_contents(monkeypatch, tmp_path):
+    ref = make_salmon_reference(tmp_path)
+    star_index = make_complete_star_index(ref)
+    original_open = type(star_index).open
+    large_names = {"Genome", "SA", "SAindex"}
+
+    def guarded_open(self, *args, **kwargs):
+        if self.name in large_names:
+            raise AssertionError(f"large STAR index file was opened for hashing: {self.name}")
+        return original_open(self, *args, **kwargs)
+
+    monkeypatch.setattr(type(star_index), "open", guarded_open)
+
+    fingerprint = fingerprint_star_index(star_index)
+
+    for name in large_names:
+        assert "sha256" not in fingerprint["files"][name]
+        assert set(fingerprint["files"][name]) == {"path", "size", "mtime_ns"}
+    for name in {"genomeParameters.txt", "chrName.txt", "chrLength.txt", "chrNameLength.txt"}:
+        assert "sha256" in fingerprint["files"][name]

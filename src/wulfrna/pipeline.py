@@ -608,22 +608,26 @@ def is_phase_complete(workdir: Path, phase: str, samples: List[Sample], quantifi
     return step_done_file(workdir, phase).exists() and outputs_exist(phase_outputs(workdir, phase, samples, quantifier, layout))
 
 
-def fingerprint_file(path: Path) -> Dict[str, str]:
-    h = hashlib.sha256()
-    with path.open("rb") as f:
-        for chunk in iter(lambda: f.read(1024 * 1024), b""):
-            h.update(chunk)
+def fingerprint_file(path: Path, *, include_sha256: bool = True) -> Dict[str, str]:
     stat = path.stat()
-    return {"path": str(path), "size": str(stat.st_size), "mtime_ns": str(stat.st_mtime_ns), "sha256": h.hexdigest()}
+    fingerprint = {"path": str(path), "size": str(stat.st_size), "mtime_ns": str(stat.st_mtime_ns)}
+    if include_sha256:
+        h = hashlib.sha256()
+        with path.open("rb") as f:
+            for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                h.update(chunk)
+        fingerprint["sha256"] = h.hexdigest()
+    return fingerprint
 
 
 def fingerprint_star_index(star_index: Path) -> Dict[str, object]:
-    files = {name: fingerprint_file(star_index / name) for name in STAR_INDEX_REQUIRED_FILES}
-    combined = hashlib.sha256()
-    for name in STAR_INDEX_REQUIRED_FILES:
-        file_fp = files[name]
-        combined.update(name.encode("utf-8"))
-        combined.update(str(file_fp["sha256"]).encode("utf-8"))
+    metadata_only_files = {"Genome", "SA", "SAindex"}
+    files = {
+        name: fingerprint_file(star_index / name, include_sha256=name not in metadata_only_files)
+        for name in STAR_INDEX_REQUIRED_FILES
+    }
+    combined_payload = {"path": str(star_index), "files": files}
+    combined = hashlib.sha256(json.dumps(combined_payload, sort_keys=True).encode("utf-8"))
     return {"path": str(star_index), "sha256": combined.hexdigest(), "files": files}
 
 
