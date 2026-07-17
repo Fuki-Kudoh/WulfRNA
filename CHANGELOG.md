@@ -1,0 +1,28 @@
+# Changelog
+
+## [0.2.0] - 2026-07-17
+
+### Added
+
+- Optional STAR alignment with `--aligner star`.
+- Paired-end and single-end STAR support.
+- Two-pass STAR alignment.
+- Coordinate-sorted BAM and BAM index generation.
+- Per-sample `SJ.out.tab`, `ReadsPerGene.out.tab`, and `Log.final.out`.
+- STAR index validation and lightweight fingerprinting.
+- Alignment-aware resume and `--force-from align`.
+- STAR and samtools version capture.
+- Automated pytest and fake-tool integration tests.
+
+### Changed
+
+- STAR outputs are isolated under `align/star/<sample>/`.
+- Salmon and kallisto abundance outputs remain unchanged.
+
+### Validation
+
+- Validated using a 500,000-pair subset of GSE157878 BMDM RNA-seq
+  against mm10.
+- BAM passed `samtools quickcheck`.
+- Unique mapping rate was 68.51%.
+- A repeated invocation resumed successfully and skipped all phases.
