@@ -58,7 +58,7 @@ def resolve_reference_dir(reference_root: Path, genome: Optional[str]) -> Path:
     return reference_dir
 
 
-def validate_reference(reference_dir: Path, quantifier: str) -> Dict[str, Path]:
+def validate_reference(reference_dir: Path, quantifier: str, aligner: str = "none") -> Dict[str, Path]:
     tx2gene = reference_dir / "combined_tx2gene.tsv"
     missing: List[str] = []
 
@@ -78,6 +78,14 @@ def validate_reference(reference_dir: Path, quantifier: str) -> Dict[str, Path]:
 
     if not tx2gene.is_file():
         missing.append(str(tx2gene))
+
+    if aligner == "star":
+        star_index = reference_dir / "star_index"
+        refs["star_index"] = star_index
+        if not star_index.is_dir():
+            missing.append(str(star_index))
+    elif aligner != "none":
+        raise PipelineError(f"Unsupported aligner: {aligner}", step="reference_check")
 
     if missing:
         raise PipelineError("Reference directory is missing required files: " + ", ".join(missing), step="reference_check")
@@ -605,7 +613,7 @@ def execute(args: argparse.Namespace) -> int:
         check_tools(base_tools + [quant_tool])
 
         reference_dir = resolve_reference_dir(reference_root, args.genome)
-        refs = validate_reference(reference_dir, args.quantifier)
+        refs = validate_reference(reference_dir, args.quantifier, args.aligner)
         layout, samples = detect_samples(workdir, args.single_end)
         tx2gene_map = parse_tx2gene(refs["tx2gene"])
         write_params(workdir, args)
@@ -616,11 +624,13 @@ def execute(args: argparse.Namespace) -> int:
             "reference_dir": str(reference_dir),
             "quantifier": args.quantifier,
             "stranded": args.stranded,
+            "aligner": args.aligner,
             "layout": layout,
             "sample_ids": [sample.sample_id for sample in samples],
             "reference_files": {
                 "index": str(refs["index"]),
                 "combined_tx2gene_tsv": str(refs["tx2gene"]),
+                **({"star_index": str(refs["star_index"])} if args.aligner == "star" else {}),
             },
             "tx2gene_fingerprint": fingerprint_file(refs["tx2gene"]),
         }

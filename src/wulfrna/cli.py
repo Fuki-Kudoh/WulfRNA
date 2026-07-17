@@ -25,6 +25,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     run_parser.add_argument("--threads", required=True, type=int, help="Total threads")
     run_parser.add_argument("--quantifier", choices=["salmon", "kallisto"], default="salmon", help="Transcript quantification backend")
+    run_parser.add_argument(
+        "--aligner",
+        choices=["none", "star"],
+        default="none",
+        help="Optional alignment backend; 'star' validates STAR reference resources but alignment execution is not implemented yet",
+    )
     run_parser.add_argument("--single-end", "--SE", dest="single_end", action="store_true", help="Use single-end FASTQ input layout")
     run_parser.add_argument("--fragment-length", type=float, help="Single-end fragment length for kallisto")
     run_parser.add_argument("--fragment-sd", type=float, help="Single-end fragment length standard deviation for kallisto")
