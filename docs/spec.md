@@ -44,6 +44,7 @@ All must be in `PATH`:
 ## Required reference files (resolved reference directory)
 Shared:
 - `combined_tx2gene.tsv`
+- `combined_gene_annotation.tsv` with unique, nonblank `gene_id`, `GeneName` (blank is normalized to `NA`), and positive integer `gene_length_bp`. Length is the exon-union length, so overlapping bases within a gene are counted once.
 
 Salmon backend:
 - `salmon_index/`
@@ -61,6 +62,20 @@ STAR aligner (`--aligner star`):
 - `star_index/chrNameLength.txt`
 
 All required STAR index files must be non-empty.
+
+### Reference preparation
+
+Build the gene annotation from the same combined GTF used for the STAR index
+and transcript-to-gene mapping:
+
+```bash
+python scripts/build_gene_annotation.py --gtf combined.gtf --output combined_gene_annotation.tsv
+```
+
+The builder considers exon features only, preserves GTF gene IDs, merges
+overlapping/adjacent one-based intervals per gene, and emits their union length.
+Missing `gene_name` becomes `NA`. Malformed exon records, invalid coordinates,
+inconsistent gene names, and a gene occurring on multiple chromosomes are fatal.
 
 ## Pipeline behavior
 1. Validate tools, references, and FASTQ inputs for the selected layout.
@@ -96,7 +111,7 @@ Resume is enabled by default. A phase is skipped only if:
 
 Machine-readable manifest:
 - `status/manifest.json`
-- Includes `workdir`, `reference_dir`, `quantifier`, `aligner`, `stranded`, `layout`, `sample_ids`, reference files used, tx2gene fingerprint, STAR index fingerprint when applicable, `created_at`, `updated_at`.
+- Includes `workdir`, `reference_dir`, `quantifier`, `aligner`, `stranded`, `layout`, `sample_ids`, reference files used, tx2gene and gene-annotation fingerprints, STAR index fingerprint when applicable, `created_at`, `updated_at`.
 
 Manifest compatibility rules:
 - sample set change => hard error (no silent resume),
@@ -105,6 +120,7 @@ Manifest compatibility rules:
 - quantifier/reference_dir/stranded change => rerun quant and downstream,
 - aligner or STAR index path/content change => rerun align and downstream when STAR alignment is enabled,
 - `combined_tx2gene.tsv` fingerprint change => reuse quant, rerun aggregate + multiqc,
+- `combined_gene_annotation.tsv` fingerprint change => reuse quant, rerun aggregate + multiqc,
 - threads-only changes are resumable.
 
 Failure handling:
@@ -115,8 +131,8 @@ Failure handling:
 
 ## Output contracts
 Primary outputs:
-- `abundance/gene_expected_counts.tsv`
-- `abundance/gene_tpm.tsv`
+- `abundance/<quantifier>_gene_expected_counts.tsv` and `abundance/<quantifier>_gene_tpm.tsv`, whose leading columns are `gene_id` and `GeneName`
+- legacy `abundance/gene_expected_counts.tsv` and `abundance/gene_tpm.tsv`, retaining the v0.2.x `gene_id` + sample-column format
 - `multiqc/multiqc_report.html`
 - `logs/tx2gene_mapping_stats.tsv`
 
@@ -126,8 +142,11 @@ STAR outputs when `--aligner star`:
 - `align/star/<sample>/SJ.out.tab`
 - `align/star/<sample>/ReadsPerGene.out.tab`
 - `align/star/<sample>/Log.final.out`
+- copied native file `abundance/star_gene_counts/<sample>.star.ReadsPerGene.out.tab`
+- integer matrix `abundance/star_gene_counts.tsv`
+- `abundance/star_gene_tpm.tsv`, WulfRNA-calculated gene-level TPM from the strandedness-selected STAR count column and exon-union gene lengths
 
-STAR outputs coexist with Salmon/kallisto outputs and do not replace or overwrite the gene-level abundance matrices.
+STAR summary rows are excluded from matrices but retained in copied native files. STAR TPM is `count / length_kb`, normalized per sample to one million; it is distinct from Salmon/kallisto transcript-quantifier TPM. Values are written with six decimal places, and the sum of those serialized values must be within an absolute tolerance of `0.01` of one million for every sample.
 
 Status markers (`WORKDIR/status/`):
 - `RUNNING` while active

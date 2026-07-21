@@ -29,6 +29,15 @@ STAR_INDEX_REQUIRED_FILES = [
     "chrLength.txt",
     "chrNameLength.txt",
 ]
+STAR_SUMMARY_ROWS = {"N_unmapped", "N_multimapping", "N_noFeature", "N_ambiguous"}
+# Absolute tolerance applied to the sum of six-decimal values serialized in STAR TPM output.
+STAR_TPM_SUM_TOLERANCE = 0.01
+
+
+@dataclass(frozen=True)
+class GeneAnnotation:
+    gene_name: str
+    gene_length_bp: int
 
 
 @dataclass(frozen=True)
@@ -71,9 +80,10 @@ def resolve_reference_dir(reference_root: Path, genome: Optional[str]) -> Path:
 
 def validate_reference(reference_dir: Path, quantifier: str, aligner: str = "none") -> Dict[str, Path]:
     tx2gene = reference_dir / "combined_tx2gene.tsv"
+    gene_annotation = reference_dir / "combined_gene_annotation.tsv"
     missing: List[str] = []
 
-    refs: Dict[str, Path] = {"tx2gene": tx2gene}
+    refs: Dict[str, Path] = {"tx2gene": tx2gene, "gene_annotation": gene_annotation}
     if quantifier == "salmon":
         salmon_index = reference_dir / "salmon_index"
         refs["index"] = salmon_index
@@ -89,6 +99,8 @@ def validate_reference(reference_dir: Path, quantifier: str, aligner: str = "non
 
     if not tx2gene.is_file():
         missing.append(str(tx2gene))
+    if not gene_annotation.is_file():
+        missing.append(str(gene_annotation))
 
     if aligner == "star":
         refs["star_index"] = validate_star_index(reference_dir / "star_index")
@@ -99,6 +111,49 @@ def validate_reference(reference_dir: Path, quantifier: str, aligner: str = "non
         raise PipelineError("Reference directory is missing required files: " + ", ".join(missing), step="reference_check")
 
     return refs
+
+
+def parse_gene_annotation(path: Path) -> Dict[str, GeneAnnotation]:
+    """Load and validate gene symbols and exon-union lengths."""
+    annotations: Dict[str, GeneAnnotation] = {}
+    with path.open("r", encoding="utf-8", newline="") as f:
+        reader = csv.DictReader(f, delimiter="\t")
+        required = {"gene_id", "GeneName", "gene_length_bp"}
+        if reader.fieldnames is None or not required.issubset(reader.fieldnames):
+            missing = sorted(required - set(reader.fieldnames or []))
+            raise PipelineError(
+                f"Gene annotation is missing required columns ({', '.join(missing)}): {path}",
+                step="reference_check",
+            )
+        for row_number, row in enumerate(reader, start=2):
+            gene_id = (row.get("gene_id") or "").strip()
+            if not gene_id:
+                raise PipelineError(f"Blank gene_id at row {row_number} in {path}", step="reference_check")
+            if gene_id in annotations:
+                raise PipelineError(f"Duplicate gene_id {gene_id!r} at row {row_number} in {path}", step="reference_check")
+            raw_length = (row.get("gene_length_bp") or "").strip()
+            try:
+                length = int(raw_length)
+            except ValueError:
+                raise PipelineError(
+                    f"Invalid gene_length_bp {raw_length!r} for gene {gene_id} in {path}", step="reference_check"
+                ) from None
+            if length <= 0:
+                raise PipelineError(f"gene_length_bp must be positive for gene {gene_id} in {path}", step="reference_check")
+            annotations[gene_id] = GeneAnnotation((row.get("GeneName") or "").strip() or "NA", length)
+    if not annotations:
+        raise PipelineError(f"No gene annotations found in {path}", step="reference_check")
+    return annotations
+
+
+def validate_gene_resource_consistency(tx2gene: Dict[str, str], annotations: Dict[str, GeneAnnotation]) -> None:
+    missing = sorted(set(tx2gene.values()) - set(annotations))
+    if missing:
+        preview = ", ".join(missing[:10])
+        raise PipelineError(
+            f"Genes from combined_tx2gene.tsv are absent from combined_gene_annotation.tsv: {preview}",
+            step="reference_check",
+        )
 
 
 def validate_star_index(star_index: Path) -> Path:
@@ -329,6 +384,9 @@ def aggregate_transcript_quant(
     out_tpm: Path,
     mapping_stats_out: Path,
     min_mapping_rate: float,
+    gene_annotations: Optional[Dict[str, GeneAnnotation]] = None,
+    legacy_expected: Optional[Path] = None,
+    legacy_tpm: Optional[Path] = None,
 ) -> None:
     sample_order = sorted(sample_quant_files)
     expected_by_gene: Dict[str, Dict[str, float]] = defaultdict(dict)
@@ -398,18 +456,113 @@ def aggregate_transcript_quant(
             for gene_id, value in sample_tpm.items():
                 tpm_by_gene[gene_id][sample] = value
 
-    write_gene_matrix(out_expected, sample_order, expected_by_gene)
-    write_gene_matrix(out_tpm, sample_order, tpm_by_gene)
+    write_gene_matrix(out_expected, sample_order, expected_by_gene, gene_annotations)
+    write_gene_matrix(out_tpm, sample_order, tpm_by_gene, gene_annotations)
+    if legacy_expected is not None:
+        write_gene_matrix(legacy_expected, sample_order, expected_by_gene)
+    if legacy_tpm is not None:
+        write_gene_matrix(legacy_tpm, sample_order, tpm_by_gene)
 
 
-def write_gene_matrix(out_file: Path, sample_order: List[str], matrix: Dict[str, Dict[str, float]]) -> None:
+def write_gene_matrix(
+    out_file: Path,
+    sample_order: List[str],
+    matrix: Dict[str, Dict[str, float]],
+    annotations: Optional[Dict[str, GeneAnnotation]] = None,
+) -> None:
     out_file.parent.mkdir(parents=True, exist_ok=True)
     with out_file.open("w", encoding="utf-8", newline="") as f:
         w = csv.writer(f, delimiter="\t")
-        w.writerow(["gene_id", *sample_order])
+        w.writerow(["gene_id", *(["GeneName"] if annotations is not None else []), *sample_order])
         for gid in sorted(matrix):
+            if annotations is not None and gid not in annotations:
+                raise PipelineError(f"Gene {gid} is absent from combined_gene_annotation.tsv", step="aggregate")
             values = [f"{matrix[gid].get(sample, 0.0):.6f}" for sample in sample_order]
-            w.writerow([gid, *values])
+            metadata = [annotations[gid].gene_name] if annotations is not None else []
+            w.writerow([gid, *metadata, *values])
+
+
+def aggregate_star_counts(
+    workdir: Path,
+    samples: List[Sample],
+    stranded: str,
+    annotations: Dict[str, GeneAnnotation],
+) -> None:
+    """Collect native STAR files and produce count and WulfRNA-calculated TPM matrices."""
+    count_index = {"none": 1, "forward": 2, "reverse": 3}[stranded]
+    sample_order = sorted(sample.sample_id for sample in samples)
+    counts_by_sample: Dict[str, Dict[str, int]] = {}
+    copy_dir = workdir / "abundance" / "star_gene_counts"
+    copy_dir.mkdir(parents=True, exist_ok=True)
+
+    for sample_id in sample_order:
+        source = workdir / "align" / "star" / sample_id / "ReadsPerGene.out.tab"
+        if not output_exists_nonempty(source):
+            raise PipelineError(f"Missing or empty STAR gene-count file: {source}", step="aggregate", sample=sample_id)
+        destination = copy_dir / f"{sample_id}.star.ReadsPerGene.out.tab"
+        shutil.copy2(source, destination)
+        sample_counts: Dict[str, int] = {}
+        with source.open("r", encoding="utf-8") as f:
+            for row_number, line in enumerate(f, start=1):
+                row = line.rstrip("\n\r").split("\t")
+                if len(row) != 4:
+                    raise PipelineError(
+                        f"STAR gene-count row {row_number} does not contain four columns: {source}",
+                        step="aggregate", sample=sample_id,
+                    )
+                gene_id = row[0]
+                if gene_id in STAR_SUMMARY_ROWS:
+                    continue
+                if gene_id in sample_counts:
+                    raise PipelineError(f"Duplicate STAR gene_id {gene_id}: {source}", step="aggregate", sample=sample_id)
+                if gene_id not in annotations:
+                    raise PipelineError(
+                        f"STAR gene {gene_id} is absent from combined_gene_annotation.tsv", step="aggregate", sample=sample_id
+                    )
+                try:
+                    sample_counts[gene_id] = int(row[count_index])
+                except ValueError:
+                    raise PipelineError(
+                        f"Non-integer STAR count for gene {gene_id}: {row[count_index]!r}", step="aggregate", sample=sample_id
+                    ) from None
+        counts_by_sample[sample_id] = sample_counts
+
+    gene_sets = {sample: set(values) for sample, values in counts_by_sample.items()}
+    first_sample = sample_order[0]
+    expected_genes = gene_sets[first_sample]
+    for sample_id in sample_order[1:]:
+        if gene_sets[sample_id] != expected_genes:
+            raise PipelineError(
+                f"STAR gene sets are inconsistent between samples {first_sample} and {sample_id}", step="aggregate", sample=sample_id
+            )
+
+    counts_matrix = {gene: {sample: counts_by_sample[sample][gene] for sample in sample_order} for gene in expected_genes}
+    counts_out = workdir / "abundance" / "star_gene_counts.tsv"
+    with counts_out.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.writer(f, delimiter="\t")
+        writer.writerow(["gene_id", "GeneName", *sample_order])
+        for gene in sorted(expected_genes):
+            writer.writerow([gene, annotations[gene].gene_name, *(counts_matrix[gene][sample] for sample in sample_order)])
+
+    tpm_matrix: Dict[str, Dict[str, float]] = defaultdict(dict)
+    for sample in sample_order:
+        rpk = {gene: counts_by_sample[sample][gene] / (annotations[gene].gene_length_bp / 1000.0) for gene in expected_genes}
+        total_rpk = sum(rpk.values())
+        if total_rpk <= 0:
+            raise PipelineError(f"Total STAR RPK is zero for sample {sample}; TPM cannot be calculated", step="aggregate", sample=sample)
+        for gene, value in rpk.items():
+            # Convert through the output representation before validating so the
+            # check covers the exact six-decimal values users receive.
+            tpm_matrix[gene][sample] = float(f"{value / total_rpk * 1_000_000.0:.6f}")
+        serialized_sum = sum(tpm_matrix[gene][sample] for gene in expected_genes)
+        if abs(serialized_sum - 1_000_000.0) > STAR_TPM_SUM_TOLERANCE:
+            raise PipelineError(
+                f"Serialized STAR TPM values sum to {serialized_sum:.6f} for sample {sample}; "
+                f"expected 1000000 within absolute tolerance {STAR_TPM_SUM_TOLERANCE}",
+                step="aggregate",
+                sample=sample,
+            )
+    write_gene_matrix(workdir / "abundance" / "star_gene_tpm.tsv", sample_order, tpm_matrix, annotations)
 
 
 def write_summary(
@@ -420,6 +573,8 @@ def write_summary(
     sample_count: int,
     completed_count: int,
     failed_count: int,
+    quantifier: str = "salmon",
+    aligner: str = "none",
 ) -> None:
     status_dir = workdir / "status"
     out = status_dir / "summary.txt"
@@ -434,8 +589,13 @@ def write_summary(
             f.write("Expected outputs (not generated in dry-run):\n")
         else:
             f.write("Main outputs:\n")
-        f.write("- abundance/gene_expected_counts.tsv\n")
-        f.write("- abundance/gene_tpm.tsv\n")
+        f.write(f"- abundance/{quantifier}_gene_expected_counts.tsv\n")
+        f.write(f"- abundance/{quantifier}_gene_tpm.tsv\n")
+        f.write("- abundance/gene_expected_counts.tsv (legacy)\n")
+        f.write("- abundance/gene_tpm.tsv (legacy)\n")
+        if aligner == "star":
+            f.write("- abundance/star_gene_counts.tsv\n")
+            f.write("- abundance/star_gene_tpm.tsv (WulfRNA-calculated from STAR counts)\n")
         f.write("- multiqc/multiqc_report.html\n")
 
 
@@ -556,7 +716,9 @@ def run_star_align(workdir: Path, sample: Sample, refs: Dict[str, Path], threads
     )
 
 
-def phase_outputs(workdir: Path, phase: str, samples: List[Sample], quantifier: str, layout: str) -> List[Path]:
+def phase_outputs(
+    workdir: Path, phase: str, samples: List[Sample], quantifier: str, layout: str, aligner: str = "none"
+) -> List[Path]:
     outputs: List[Path] = []
     if phase == "fastqc_raw":
         outdir = workdir / "qc" / "fastqc_raw"
@@ -592,7 +754,18 @@ def phase_outputs(workdir: Path, phase: str, samples: List[Sample], quantifier: 
             for sample in samples:
                 outputs.append(workdir / "abundance" / "kallisto" / sample.sample_id / "abundance.tsv")
     elif phase == "aggregate":
-        outputs.extend([workdir / "abundance/gene_expected_counts.tsv", workdir / "abundance/gene_tpm.tsv"])
+        outputs.extend([
+            workdir / "abundance" / f"{quantifier}_gene_expected_counts.tsv",
+            workdir / "abundance" / f"{quantifier}_gene_tpm.tsv",
+            workdir / "abundance/gene_expected_counts.tsv",
+            workdir / "abundance/gene_tpm.tsv",
+        ])
+        if aligner == "star":
+            outputs.extend([workdir / "abundance/star_gene_counts.tsv", workdir / "abundance/star_gene_tpm.tsv"])
+            outputs.extend(
+                workdir / "abundance/star_gene_counts" / f"{sample.sample_id}.star.ReadsPerGene.out.tab"
+                for sample in samples
+            )
     elif phase == "multiqc":
         outputs.append(workdir / "multiqc/multiqc_report.html")
     else:
@@ -604,8 +777,8 @@ def outputs_exist(paths: List[Path]) -> bool:
     return all(output_exists_nonempty(path) for path in paths)
 
 
-def is_phase_complete(workdir: Path, phase: str, samples: List[Sample], quantifier: str, layout: str) -> bool:
-    return step_done_file(workdir, phase).exists() and outputs_exist(phase_outputs(workdir, phase, samples, quantifier, layout))
+def is_phase_complete(workdir: Path, phase: str, samples: List[Sample], quantifier: str, layout: str, aligner: str = "none") -> bool:
+    return step_done_file(workdir, phase).exists() and outputs_exist(phase_outputs(workdir, phase, samples, quantifier, layout, aligner))
 
 
 def fingerprint_file(path: Path, *, include_sha256: bool = True) -> Dict[str, str]:
@@ -696,6 +869,8 @@ def compare_manifest(existing: Dict[str, object], current: Dict[str, object]) ->
     new_fp = current.get("tx2gene_fingerprint", {})
     if old_fp != new_fp:
         force_from("aggregate", "combined_tx2gene.tsv fingerprint changed")
+    if existing.get("gene_annotation_fingerprint") != current.get("gene_annotation_fingerprint"):
+        force_from("aggregate", "combined_gene_annotation.tsv fingerprint changed")
 
     return forced_phase, reasons
 
@@ -708,12 +883,13 @@ def should_run_phase(
     layout: str,
     no_resume: bool,
     effective_force_from: Optional[str],
+    aligner: str = "none",
 ) -> bool:
     if no_resume:
         return True
     if effective_force_from is not None and phase_index(phase) >= phase_index(effective_force_from):
         return True
-    return not is_phase_complete(workdir, phase, samples, quantifier, layout)
+    return not is_phase_complete(workdir, phase, samples, quantifier, layout, aligner)
 
 
 def execute(args: argparse.Namespace) -> int:
@@ -740,6 +916,8 @@ def execute(args: argparse.Namespace) -> int:
         refs = validate_reference(reference_dir, args.quantifier, args.aligner)
         layout, samples = detect_samples(workdir, args.single_end)
         tx2gene_map = parse_tx2gene(refs["tx2gene"])
+        gene_annotations = parse_gene_annotation(refs["gene_annotation"])
+        validate_gene_resource_consistency(tx2gene_map, gene_annotations)
         write_params(workdir, args)
         capture_versions(workdir)
 
@@ -754,9 +932,11 @@ def execute(args: argparse.Namespace) -> int:
             "reference_files": {
                 "index": str(refs["index"]),
                 "combined_tx2gene_tsv": str(refs["tx2gene"]),
+                "combined_gene_annotation_tsv": str(refs["gene_annotation"]),
                 **({"star_index": str(refs["star_index"])} if args.aligner == "star" else {}),
             },
             "tx2gene_fingerprint": fingerprint_file(refs["tx2gene"]),
+            "gene_annotation_fingerprint": fingerprint_file(refs["gene_annotation"]),
             **({"star_index_fingerprint": fingerprint_star_index(refs["star_index"])} if args.aligner == "star" else {}),
         }
         existing_manifest = load_manifest(workdir)
@@ -781,6 +961,8 @@ def execute(args: argparse.Namespace) -> int:
                 len(samples),
                 0,
                 0,
+                args.quantifier,
+                args.aligner,
             )
             return 0
 
@@ -792,7 +974,9 @@ def execute(args: argparse.Namespace) -> int:
 
         quant_map: Dict[str, Path] = {}
         for phase in selected_phases(args.aligner):
-            phase_should_run = should_run_phase(workdir, phase, samples, args.quantifier, layout, args.no_resume, effective_force_from)
+            phase_should_run = should_run_phase(
+                workdir, phase, samples, args.quantifier, layout, args.no_resume, effective_force_from, args.aligner
+            )
             if not phase_should_run:
                 print(f"[skip] {phase}")
                 continue
@@ -855,11 +1039,16 @@ def execute(args: argparse.Namespace) -> int:
                     quant_map,
                     tx2gene_map,
                     args.quantifier,
-                    workdir / "abundance/gene_expected_counts.tsv",
-                    workdir / "abundance/gene_tpm.tsv",
+                    workdir / "abundance" / f"{args.quantifier}_gene_expected_counts.tsv",
+                    workdir / "abundance" / f"{args.quantifier}_gene_tpm.tsv",
                     workdir / "logs" / "tx2gene_mapping_stats.tsv",
                     args.min_mapping_rate,
+                    gene_annotations,
+                    workdir / "abundance/gene_expected_counts.tsv",
+                    workdir / "abundance/gene_tpm.tsv",
                 )
+                if args.aligner == "star":
+                    aggregate_star_counts(workdir, samples, args.stranded, gene_annotations)
             elif phase == "multiqc":
                 run_cmd(
                     ["multiqc", str(workdir), "-o", str(workdir / "multiqc")],
@@ -870,16 +1059,20 @@ def execute(args: argparse.Namespace) -> int:
             else:
                 raise PipelineError(f"Unhandled phase: {phase}", step="resume")
 
-            if not outputs_exist(phase_outputs(workdir, phase, samples, args.quantifier, layout)):
+            if not outputs_exist(phase_outputs(workdir, phase, samples, args.quantifier, layout, args.aligner)):
                 raise PipelineError(f"Expected outputs missing after phase: {phase}", step=phase)
             mark_phase_done(workdir, phase)
             print(f"[done] {phase}")
 
         required_outputs = [
+            workdir / "abundance" / f"{args.quantifier}_gene_expected_counts.tsv",
+            workdir / "abundance" / f"{args.quantifier}_gene_tpm.tsv",
             workdir / "abundance/gene_expected_counts.tsv",
             workdir / "abundance/gene_tpm.tsv",
             workdir / "multiqc/multiqc_report.html",
         ]
+        if args.aligner == "star":
+            required_outputs.extend([workdir / "abundance/star_gene_counts.tsv", workdir / "abundance/star_gene_tpm.tsv"])
         for path in required_outputs:
             if not path.exists():
                 raise PipelineError(f"Required output missing: {path}", step="final_validation")
@@ -898,6 +1091,8 @@ def execute(args: argparse.Namespace) -> int:
             len(samples),
             completed_samples,
             0,
+            args.quantifier,
+            args.aligner,
         )
         return 0
 
@@ -918,6 +1113,8 @@ def execute(args: argparse.Namespace) -> int:
             len(samples),
             completed_samples,
             max(0, len(samples) - completed_samples),
+            args.quantifier,
+            args.aligner,
         )
         print(f"ERROR: {e}", file=sys.stderr)
         return 1

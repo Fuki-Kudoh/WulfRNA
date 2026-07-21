@@ -12,12 +12,14 @@ from wulfrna.pipeline import (
 
 def make_salmon_reference(tmp_path):
     (tmp_path / "combined_tx2gene.tsv").write_text("tx1\tgene1\n", encoding="utf-8")
+    (tmp_path / "combined_gene_annotation.tsv").write_text("gene_id\tGeneName\tgene_length_bp\ngene1\tGene1\t1000\n", encoding="utf-8")
     (tmp_path / "salmon_index").mkdir()
     return tmp_path
 
 
 def make_kallisto_reference(tmp_path):
     (tmp_path / "combined_tx2gene.tsv").write_text("tx1\tgene1\n", encoding="utf-8")
+    (tmp_path / "combined_gene_annotation.tsv").write_text("gene_id\tGeneName\tgene_length_bp\ngene1\tGene1\t1000\n", encoding="utf-8")
     kallisto_dir = tmp_path / "kallisto_index"
     kallisto_dir.mkdir()
     (kallisto_dir / "combined_transcripts.kidx").write_text("index\n", encoding="utf-8")
@@ -171,3 +173,37 @@ def test_fingerprint_star_index_does_not_hash_large_index_file_contents(monkeypa
         assert set(fingerprint["files"][name]) == {"path", "size", "mtime_ns"}
     for name in {"genomeParameters.txt", "chrName.txt", "chrLength.txt", "chrNameLength.txt"}:
         assert "sha256" in fingerprint["files"][name]
+
+
+def test_parse_gene_annotation_normalizes_missing_symbol(tmp_path):
+    from wulfrna.pipeline import parse_gene_annotation
+
+    path = tmp_path / "combined_gene_annotation.tsv"
+    path.write_text("gene_id\tGeneName\tgene_length_bp\ngene1\t\t123\n", encoding="utf-8")
+    annotation = parse_gene_annotation(path)
+    assert annotation["gene1"].gene_name == "NA"
+    assert annotation["gene1"].gene_length_bp == 123
+
+
+@pytest.mark.parametrize("contents, message", [
+    ("gene_id\tGeneName\ngene1\tG1\n", "missing required columns"),
+    ("gene_id\tGeneName\tgene_length_bp\ngene1\tG1\t10\ngene1\tG1\t10\n", "Duplicate gene_id"),
+    ("gene_id\tGeneName\tgene_length_bp\ngene1\tG1\t0\n", "must be positive"),
+    ("gene_id\tGeneName\tgene_length_bp\ngene1\tG1\tbad\n", "Invalid gene_length_bp"),
+])
+def test_parse_gene_annotation_rejects_invalid_resources(tmp_path, contents, message):
+    from wulfrna.pipeline import parse_gene_annotation
+
+    path = tmp_path / "combined_gene_annotation.tsv"
+    path.write_text(contents, encoding="utf-8")
+    with pytest.raises(PipelineError, match=message) as exc:
+        parse_gene_annotation(path)
+    assert exc.value.step == "reference_check"
+
+
+def test_gene_resource_consistency_rejects_missing_gene():
+    from wulfrna.pipeline import GeneAnnotation, validate_gene_resource_consistency
+
+    with pytest.raises(PipelineError, match="gene2") as exc:
+        validate_gene_resource_consistency({"tx": "gene2"}, {"gene1": GeneAnnotation("G1", 10)})
+    assert exc.value.step == "reference_check"

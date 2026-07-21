@@ -2,9 +2,9 @@ cff-version: 1.2.0
 message: "If you use WulfRNA in your research, please cite this software."
 title: "WulfRNA"
 type: software
-version: "0.2.1"
+version: "0.2.2"
 doi: "10.5281/zenodo.21409117"
-date-released: "2026-07-17"
+date-released: "2026-07-21"
 authors:
   - family-names: "Kudoh"
     given-names: "Fuki"

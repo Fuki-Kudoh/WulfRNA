@@ -1,6 +1,8 @@
 import stat
 from pathlib import Path
 
+import pytest
+
 from wulfrna.cli import parse_args
 from wulfrna.pipeline import STAR_INDEX_REQUIRED_FILES, execute
 
@@ -93,8 +95,9 @@ if '--version' in args:
     raise SystemExit(0)
 prefix = Path(args[args.index('--outFileNamePrefix') + 1])
 prefix.mkdir(parents=True, exist_ok=True)
-for name in ['Aligned.sortedByCoord.out.bam', 'SJ.out.tab', 'ReadsPerGene.out.tab', 'Log.final.out']:
+for name in ['Aligned.sortedByCoord.out.bam', 'SJ.out.tab', 'Log.final.out']:
     (prefix / name).write_text(f'{name}\n', encoding='utf-8')
+(prefix / 'ReadsPerGene.out.tab').write_text('N_unmapped\t0\t0\t0\nN_multimapping\t0\t0\t0\nN_noFeature\t0\t0\t0\nN_ambiguous\t0\t0\t0\ngene1\t5\t6\t7\n', encoding='utf-8')
 """,
         )
         write_executable(
@@ -113,14 +116,17 @@ Path(str(bam) + '.bai').write_text('bai\n', encoding='utf-8')
 
 def make_reference(ref_dir: Path) -> None:
     (ref_dir / "combined_tx2gene.tsv").write_text("tx1\tgene1\n", encoding="utf-8")
+    (ref_dir / "combined_gene_annotation.tsv").write_text("gene_id\tGeneName\tgene_length_bp\ngene1\tGene1\t1000\n", encoding="utf-8")
     (ref_dir / "salmon_index").mkdir()
+    (ref_dir / "kallisto_index").mkdir()
+    (ref_dir / "kallisto_index" / "combined_transcripts.kidx").write_text("index\n", encoding="utf-8")
     star_index = ref_dir / "star_index"
     star_index.mkdir()
     for name in STAR_INDEX_REQUIRED_FILES:
         (star_index / name).write_text(f"{name}\n", encoding="utf-8")
 
 
-def run_pipeline(tmp_path, monkeypatch, single_end: bool):
+def run_pipeline(tmp_path, monkeypatch, single_end: bool, quantifier: str = "salmon"):
     bin_dir = tmp_path / "bin"
     workdir = tmp_path / "work"
     ref_dir = tmp_path / "ref"
@@ -150,6 +156,8 @@ def run_pipeline(tmp_path, monkeypatch, single_end: bool):
         "2",
         "--aligner",
         "star",
+        "--quantifier",
+        quantifier,
         *layout_args,
     ])
 
@@ -169,6 +177,16 @@ def assert_star_outputs(workdir: Path) -> None:
         assert (star_dir / name).stat().st_size > 0
     assert (workdir / "abundance" / "gene_expected_counts.tsv").stat().st_size > 0
     assert (workdir / "abundance" / "gene_tpm.tsv").stat().st_size > 0
+    assert (workdir / "abundance" / "salmon_gene_expected_counts.tsv").read_text().splitlines()[0] == "gene_id\tGeneName\tsample"
+    assert (workdir / "abundance" / "salmon_gene_tpm.tsv").read_text().splitlines()[0] == "gene_id\tGeneName\tsample"
+    assert (workdir / "abundance" / "gene_expected_counts.tsv").read_text().splitlines()[0] == "gene_id\tsample"
+    copied = workdir / "abundance" / "star_gene_counts" / "sample.star.ReadsPerGene.out.tab"
+    original = workdir / "align" / "star" / "sample" / "ReadsPerGene.out.tab"
+    assert copied.read_bytes() == original.read_bytes()
+    counts = (workdir / "abundance" / "star_gene_counts.tsv").read_text().splitlines()
+    assert counts == ["gene_id\tGeneName\tsample", "gene1\tGene1\t7"]
+    tpm = (workdir / "abundance" / "star_gene_tpm.tsv").read_text().splitlines()
+    assert tpm == ["gene_id\tGeneName\tsample", "gene1\tGene1\t1000000.000000"]
 
     star_log = (workdir / "logs" / "steps" / "sample.star.log").read_text(encoding="utf-8")
     assert "--twopassMode Basic" in star_log
@@ -248,3 +266,61 @@ def test_star_tools_required_when_aligner_star(monkeypatch, tmp_path):
 
     assert execute(args) == 1
     assert (workdir / "status" / "failed_step.txt").read_text(encoding="utf-8") == "tool_check\n"
+
+
+@pytest.mark.parametrize("quantifier", ["salmon", "kallisto"])
+def test_v021_migration_and_annotation_resume_behavior(monkeypatch, tmp_path, quantifier):
+    import json
+    import wulfrna.pipeline as pipeline
+
+    workdir = run_pipeline(tmp_path, monkeypatch, single_end=False, quantifier=quantifier)
+    ref_dir = tmp_path / "ref"
+    args = parse_args([
+        "run", str(workdir), "--reference", str(ref_dir),
+        "--stranded", "reverse", "--threads", "2", "--aligner", "star", "--quantifier", quantifier,
+    ])
+
+    # Model a completed v0.2.1 directory: phase markers and legacy matrices
+    # exist, but source-qualified/STAR aggregate products and annotation
+    # manifest fields do not.
+    for path in [
+        workdir / "abundance" / f"{quantifier}_gene_expected_counts.tsv",
+        workdir / "abundance" / f"{quantifier}_gene_tpm.tsv",
+        workdir / "abundance/star_gene_counts.tsv",
+        workdir / "abundance/star_gene_tpm.tsv",
+        workdir / "abundance/star_gene_counts/sample.star.ReadsPerGene.out.tab",
+    ]:
+        path.unlink()
+    manifest_path = workdir / "status/manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest.pop("gene_annotation_fingerprint")
+    manifest["reference_files"].pop("combined_gene_annotation_tsv")
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    def unexpected(*args, **kwargs):
+        raise AssertionError("alignment or transcript quantification was unexpectedly rerun")
+
+    monkeypatch.setattr(pipeline, "run_star_align", unexpected)
+    monkeypatch.setattr(pipeline, "run_salmon_quant", unexpected)
+    monkeypatch.setattr(pipeline, "run_kallisto_quant", unexpected)
+    assert execute(args) == 0
+    assert (workdir / "abundance/star_gene_counts/sample.star.ReadsPerGene.out.tab").is_file()
+
+    # Annotation content changes invalidate aggregate and downstream only.
+    annotation = ref_dir / "combined_gene_annotation.tsv"
+    annotation.write_text("gene_id\tGeneName\tgene_length_bp\ngene1\tChanged\t2000\n", encoding="utf-8")
+    assert execute(args) == 0
+    assert "Changed" in (workdir / "abundance/star_gene_tpm.tsv").read_text(encoding="utf-8")
+
+    # With all outputs and fingerprints unchanged, aggregate is skipped.
+    monkeypatch.setattr(pipeline, "aggregate_transcript_quant", unexpected)
+    monkeypatch.setattr(pipeline, "aggregate_star_counts", unexpected)
+    assert execute(args) == 0
+
+
+def test_star_copied_files_are_required_for_aggregate_completion(tmp_path):
+    from wulfrna.pipeline import LAYOUT_PAIRED, Sample, phase_outputs
+
+    sample = Sample("sample", tmp_path / "sample_R1.fastq.gz", tmp_path / "sample_R2.fastq.gz")
+    outputs = phase_outputs(tmp_path, "aggregate", [sample], "salmon", LAYOUT_PAIRED, "star")
+    assert tmp_path / "abundance/star_gene_counts/sample.star.ReadsPerGene.out.tab" in outputs
