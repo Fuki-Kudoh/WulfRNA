@@ -8,7 +8,8 @@
 WulfRNA is a packaged CLI for a focused bulk RNA-seq workflow on paired-end (default) or single-end FASTQ input.
 
 Current outputs:
-- gene-level expected counts and TPM from Salmon or kallisto
+- source-qualified, gene-level expected counts and TPM from Salmon or kallisto
+- optional STAR count and WulfRNA-calculated gene-level TPM matrices
 - optional coordinate-sorted STAR BAM and BAI
 - STAR splice-junction and gene-count outputs
 - final MultiQC report
@@ -17,7 +18,7 @@ Pipeline steps: FastQC (raw) → Cutadapt → FastQC (trimmed) →
 optional STAR alignment → transcript quantification (Salmon or kallisto) →
 gene-level aggregation → MultiQC.
 
-Public-readiness note: WulfRNA v0.2.1 is a lightweight single-server
+Public-readiness note: WulfRNA v0.2.2 is a lightweight single-server
 bulk RNA-seq runner intended for local or HPC workstation use.
 
 ## 1) Prerequisites
@@ -69,6 +70,7 @@ This installs the `wulfrna` command.
 `--reference` must point to a directory containing backend-specific resources plus a shared tx2gene map:
 
 - shared: `combined_tx2gene.tsv`
+- shared: `combined_gene_annotation.tsv`, with columns `gene_id`, `GeneName`, and positive integer `gene_length_bp` (the union length of annotated exons, counting overlaps once)
 - Salmon backend: `salmon_index/`
 - kallisto backend: `kallisto_index/combined_transcripts.kidx`
 - STAR aligner (when `--aligner star`): `star_index/` containing non-empty `Genome`, `SA`, `SAindex`, `genomeParameters.txt`, `chrName.txt`, `chrLength.txt`, and `chrNameLength.txt`
@@ -117,8 +119,10 @@ Notes:
 ## 6) Main outputs and status markers
 
 Expected primary outputs on full success:
-- `abundance/gene_expected_counts.tsv`
-- `abundance/gene_tpm.tsv`
+- `abundance/<quantifier>_gene_expected_counts.tsv`
+- `abundance/<quantifier>_gene_tpm.tsv`
+- `abundance/gene_expected_counts.tsv` (legacy v0.2.x compatibility output without `GeneName`)
+- `abundance/gene_tpm.tsv` (legacy v0.2.x compatibility output without `GeneName`)
 - `multiqc/multiqc_report.html`
 - `logs/tx2gene_mapping_stats.tsv`
 
@@ -128,8 +132,11 @@ Additional outputs when `--aligner star` is selected (per sample):
 - `align/star/<sample>/SJ.out.tab`
 - `align/star/<sample>/ReadsPerGene.out.tab`
 - `align/star/<sample>/Log.final.out`
+- `abundance/star_gene_counts/<sample>.star.ReadsPerGene.out.tab` (metadata-preserving copy)
+- `abundance/star_gene_counts.tsv`
+- `abundance/star_gene_tpm.tsv`
 
-STAR outputs coexist with Salmon/kallisto outputs. STAR gene counts are not aggregated into `abundance/gene_expected_counts.tsv` or `abundance/gene_tpm.tsv`.
+New matrices begin with `gene_id`, `GeneName`, then deterministically sorted sample columns. Salmon/kallisto TPM is summed from transcript-quantifier output. In contrast, `star_gene_tpm.tsv` is **WulfRNA-calculated gene-level TPM from STAR counts** using exon-union lengths from `combined_gene_annotation.tsv`; it is not a native STAR output. STAR's count column is selected from `--stranded` (`none`: column 2, `forward`: column 3, `reverse`: column 4).
 
 Matrix behavior note:
 - Gene-level matrices include only genes observed in the transcript quantification input (unobserved zero-only genes are not emitted).
@@ -166,6 +173,7 @@ Conservative compatibility rules:
 - If `quantifier`, `reference_dir`, or `stranded` changed: `quant` and downstream phases rerun.
 - If `aligner` or STAR index content changed: `align` and downstream phases rerun when STAR alignment is enabled.
 - If `combined_tx2gene.tsv` fingerprint changed: `aggregate` and `multiqc` rerun.
+- If `combined_gene_annotation.tsv` fingerprint changed: `aggregate` and `multiqc` rerun.
 - If only thread count changed: resume is allowed.
 
 To fully disable resume:
@@ -188,7 +196,7 @@ wulfrna run WORKDIR --reference REFDIR --stranded reverse --threads 16 --force-f
 
 If you use WulfRNA in your research, please cite:
 
-> Kudoh, F. (2026). WulfRNA (Version 0.2.1) [Computer software].
+> Kudoh, F. (2026). WulfRNA (Version 0.2.2) [Computer software].
 > Zenodo. https://doi.org/10.5281/zenodo.21409117
 
 Citation metadata is also available in `CITATION.cff`.

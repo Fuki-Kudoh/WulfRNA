@@ -93,8 +93,9 @@ if '--version' in args:
     raise SystemExit(0)
 prefix = Path(args[args.index('--outFileNamePrefix') + 1])
 prefix.mkdir(parents=True, exist_ok=True)
-for name in ['Aligned.sortedByCoord.out.bam', 'SJ.out.tab', 'ReadsPerGene.out.tab', 'Log.final.out']:
+for name in ['Aligned.sortedByCoord.out.bam', 'SJ.out.tab', 'Log.final.out']:
     (prefix / name).write_text(f'{name}\n', encoding='utf-8')
+(prefix / 'ReadsPerGene.out.tab').write_text('N_unmapped\t0\t0\t0\nN_multimapping\t0\t0\t0\nN_noFeature\t0\t0\t0\nN_ambiguous\t0\t0\t0\ngene1\t5\t6\t7\n', encoding='utf-8')
 """,
         )
         write_executable(
@@ -113,6 +114,7 @@ Path(str(bam) + '.bai').write_text('bai\n', encoding='utf-8')
 
 def make_reference(ref_dir: Path) -> None:
     (ref_dir / "combined_tx2gene.tsv").write_text("tx1\tgene1\n", encoding="utf-8")
+    (ref_dir / "combined_gene_annotation.tsv").write_text("gene_id\tGeneName\tgene_length_bp\ngene1\tGene1\t1000\n", encoding="utf-8")
     (ref_dir / "salmon_index").mkdir()
     star_index = ref_dir / "star_index"
     star_index.mkdir()
@@ -169,6 +171,16 @@ def assert_star_outputs(workdir: Path) -> None:
         assert (star_dir / name).stat().st_size > 0
     assert (workdir / "abundance" / "gene_expected_counts.tsv").stat().st_size > 0
     assert (workdir / "abundance" / "gene_tpm.tsv").stat().st_size > 0
+    assert (workdir / "abundance" / "salmon_gene_expected_counts.tsv").read_text().splitlines()[0] == "gene_id\tGeneName\tsample"
+    assert (workdir / "abundance" / "salmon_gene_tpm.tsv").read_text().splitlines()[0] == "gene_id\tGeneName\tsample"
+    assert (workdir / "abundance" / "gene_expected_counts.tsv").read_text().splitlines()[0] == "gene_id\tsample"
+    copied = workdir / "abundance" / "star_gene_counts" / "sample.star.ReadsPerGene.out.tab"
+    original = workdir / "align" / "star" / "sample" / "ReadsPerGene.out.tab"
+    assert copied.read_bytes() == original.read_bytes()
+    counts = (workdir / "abundance" / "star_gene_counts.tsv").read_text().splitlines()
+    assert counts == ["gene_id\tGeneName\tsample", "gene1\tGene1\t7"]
+    tpm = (workdir / "abundance" / "star_gene_tpm.tsv").read_text().splitlines()
+    assert tpm == ["gene_id\tGeneName\tsample", "gene1\tGene1\t1000000.000000"]
 
     star_log = (workdir / "logs" / "steps" / "sample.star.log").read_text(encoding="utf-8")
     assert "--twopassMode Basic" in star_log
