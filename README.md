@@ -75,6 +75,25 @@ This installs the `wulfrna` command.
 - kallisto backend: `kallisto_index/combined_transcripts.kidx`
 - STAR aligner (when `--aligner star`): `star_index/` containing non-empty `Genome`, `SA`, `SAindex`, `genomeParameters.txt`, `chrName.txt`, `chrLength.txt`, and `chrNameLength.txt`
 
+### Build the shared gene annotation
+
+Generate `combined_gene_annotation.tsv` from the same GTF used to build the
+STAR index and `combined_tx2gene.tsv`:
+
+```bash
+python scripts/build_gene_annotation.py \
+  --gtf /path/to/combined.gtf \
+  --output /path/to/reference/combined_gene_annotation.tsv
+```
+
+The builder reads exon records, preserves each GTF `gene_id` exactly, merges
+overlapping or adjacent exon intervals within a gene, and writes their union
+length as `gene_length_bp`. It uses `gene_name` for `GeneName` and writes `NA`
+when no symbol exists. A gene assigned to multiple chromosomes, inconsistent
+gene names, malformed records, or invalid coordinates cause a clear failure.
+Use the identical combined GTF for all reference artifacts so gene IDs match
+between this table, `combined_tx2gene.tsv`, and STAR.
+
 ## 4) Run command
 
 ```bash
@@ -136,7 +155,7 @@ Additional outputs when `--aligner star` is selected (per sample):
 - `abundance/star_gene_counts.tsv`
 - `abundance/star_gene_tpm.tsv`
 
-New matrices begin with `gene_id`, `GeneName`, then deterministically sorted sample columns. Salmon/kallisto TPM is summed from transcript-quantifier output. In contrast, `star_gene_tpm.tsv` is **WulfRNA-calculated gene-level TPM from STAR counts** using exon-union lengths from `combined_gene_annotation.tsv`; it is not a native STAR output. STAR's count column is selected from `--stranded` (`none`: column 2, `forward`: column 3, `reverse`: column 4).
+New matrices begin with `gene_id`, `GeneName`, then deterministically sorted sample columns. Salmon/kallisto TPM is summed from transcript-quantifier output. In contrast, `star_gene_tpm.tsv` is **WulfRNA-calculated gene-level TPM from STAR counts** using exon-union lengths from `combined_gene_annotation.tsv`; it is not a native STAR output. STAR's count column is selected from `--stranded` (`none`: column 2, `forward`: column 3, `reverse`: column 4). STAR TPM values are serialized with six decimal places, then each serialized sample column is required to sum to 1,000,000 within an absolute tolerance of `0.01`.
 
 Matrix behavior note:
 - Gene-level matrices include only genes observed in the transcript quantification input (unobserved zero-only genes are not emitted).

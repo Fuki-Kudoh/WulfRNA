@@ -7,11 +7,13 @@
 - Source-qualified Salmon and kallisto matrices with gene symbols.
 - Validated and fingerprinted `combined_gene_annotation.tsv` reference metadata.
 - Collected STAR gene-count files, an integer gene-count matrix, and WulfRNA-calculated gene-level TPM based on exon-union lengths.
+- Added a reproducible GTF exon-union builder for `combined_gene_annotation.tsv`.
 
 ### Changed
 
 - Aggregate resume and final validation now require all applicable canonical outputs.
 - Legacy unqualified matrices remain available for v0.2.x compatibility.
+- STAR TPM validation now checks the serialized six-decimal values, and resume/error-path coverage includes v0.2.1 migration.
 
 ## [0.2.1] - 2026-07-17
 

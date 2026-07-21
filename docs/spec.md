@@ -63,6 +63,20 @@ STAR aligner (`--aligner star`):
 
 All required STAR index files must be non-empty.
 
+### Reference preparation
+
+Build the gene annotation from the same combined GTF used for the STAR index
+and transcript-to-gene mapping:
+
+```bash
+python scripts/build_gene_annotation.py --gtf combined.gtf --output combined_gene_annotation.tsv
+```
+
+The builder considers exon features only, preserves GTF gene IDs, merges
+overlapping/adjacent one-based intervals per gene, and emits their union length.
+Missing `gene_name` becomes `NA`. Malformed exon records, invalid coordinates,
+inconsistent gene names, and a gene occurring on multiple chromosomes are fatal.
+
 ## Pipeline behavior
 1. Validate tools, references, and FASTQ inputs for the selected layout.
 2. Record metadata (`samples.tsv`, run parameters, versions).
@@ -132,7 +146,7 @@ STAR outputs when `--aligner star`:
 - integer matrix `abundance/star_gene_counts.tsv`
 - `abundance/star_gene_tpm.tsv`, WulfRNA-calculated gene-level TPM from the strandedness-selected STAR count column and exon-union gene lengths
 
-STAR summary rows are excluded from matrices but retained in copied native files. STAR TPM is `count / length_kb`, normalized per sample to one million; it is distinct from Salmon/kallisto transcript-quantifier TPM.
+STAR summary rows are excluded from matrices but retained in copied native files. STAR TPM is `count / length_kb`, normalized per sample to one million; it is distinct from Salmon/kallisto transcript-quantifier TPM. Values are written with six decimal places, and the sum of those serialized values must be within an absolute tolerance of `0.01` of one million for every sample.
 
 Status markers (`WORKDIR/status/`):
 - `RUNNING` while active

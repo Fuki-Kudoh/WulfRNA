@@ -30,6 +30,7 @@ STAR_INDEX_REQUIRED_FILES = [
     "chrNameLength.txt",
 ]
 STAR_SUMMARY_ROWS = {"N_unmapped", "N_multimapping", "N_noFeature", "N_ambiguous"}
+# Absolute tolerance applied to the sum of six-decimal values serialized in STAR TPM output.
 STAR_TPM_SUM_TOLERANCE = 0.01
 
 
@@ -550,9 +551,17 @@ def aggregate_star_counts(
         if total_rpk <= 0:
             raise PipelineError(f"Total STAR RPK is zero for sample {sample}; TPM cannot be calculated", step="aggregate", sample=sample)
         for gene, value in rpk.items():
-            tpm_matrix[gene][sample] = value / total_rpk * 1_000_000.0
-        if abs(sum(tpm_matrix[gene][sample] for gene in expected_genes) - 1_000_000.0) > STAR_TPM_SUM_TOLERANCE:
-            raise PipelineError(f"STAR TPM validation failed for sample {sample}", step="aggregate", sample=sample)
+            # Convert through the output representation before validating so the
+            # check covers the exact six-decimal values users receive.
+            tpm_matrix[gene][sample] = float(f"{value / total_rpk * 1_000_000.0:.6f}")
+        serialized_sum = sum(tpm_matrix[gene][sample] for gene in expected_genes)
+        if abs(serialized_sum - 1_000_000.0) > STAR_TPM_SUM_TOLERANCE:
+            raise PipelineError(
+                f"Serialized STAR TPM values sum to {serialized_sum:.6f} for sample {sample}; "
+                f"expected 1000000 within absolute tolerance {STAR_TPM_SUM_TOLERANCE}",
+                step="aggregate",
+                sample=sample,
+            )
     write_gene_matrix(workdir / "abundance" / "star_gene_tpm.tsv", sample_order, tpm_matrix, annotations)
 
 
