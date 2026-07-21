@@ -34,6 +34,27 @@ def test_builds_sorted_exon_union_lengths_and_missing_names(tmp_path):
     ]
 
 
+def test_supports_realistic_gencode_unquoted_numeric_attributes(tmp_path):
+    gtf = tmp_path / "gencode.gtf"
+    gtf.write_text(
+        'chr1\tHAVANA\texon\t100\t200\t.\t+\t.\t'
+        'gene_id "ENSMUSG00000000001.1"; transcript_id "ENSMUST00000000001.1"; '
+        'gene_name "Gnai3"; exon_number 1; level 2; tag "basic";\n'
+        'chr1\tHAVANA\texon\t180\t250\t.\t+\t.\t'
+        'gene_id "ENSMUSG00000000001.1"; transcript_id "ENSMUST00000000002.1"; '
+        'gene_name "Gnai3"; exon_number 2; level 2; tag "basic";\n',
+        encoding="utf-8",
+    )
+    output = tmp_path / "combined_gene_annotation.tsv"
+
+    builder.build_gene_annotation(gtf, output)
+
+    assert output.read_text(encoding="utf-8").splitlines() == [
+        "gene_id\tGeneName\tgene_length_bp",
+        "ENSMUSG00000000001.1\tGnai3\t151",
+    ]
+
+
 def test_rejects_gene_on_multiple_chromosomes(tmp_path):
     gtf = tmp_path / "combined.gtf"
     gtf.write_text(

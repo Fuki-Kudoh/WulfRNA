@@ -11,7 +11,9 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 
 
-ATTRIBUTE_RE = re.compile(r'^\s*([^\s]+)\s+"([^"]*)"\s*$')
+ATTRIBUTE_RE = re.compile(
+    r'^\s*(?P<key>\S+)\s+(?:"(?P<quoted>[^"]*)"|(?P<unquoted>\S+))\s*$'
+)
 
 
 class AnnotationBuildError(Exception):
@@ -34,7 +36,10 @@ def parse_attributes(text: str, line_number: int) -> Dict[str, str]:
         match = ATTRIBUTE_RE.match(item)
         if match is None:
             raise AnnotationBuildError(f"Malformed GTF attribute at line {line_number}: {item!r}")
-        key, value = match.groups()
+        key = match.group("key")
+        quoted_value = match.group("quoted")
+        value = quoted_value if quoted_value is not None else match.group("unquoted")
+        assert value is not None
         attributes[key] = value
     return attributes
 
