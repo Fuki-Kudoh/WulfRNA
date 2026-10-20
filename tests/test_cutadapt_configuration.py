@@ -295,7 +295,7 @@ def write_executable(path: Path):
     path.chmod(path.stat().st_mode | stat.S_IXUSR)
 
 
-def test_dry_run_with_changed_trimming_does_not_overwrite_manifest_or_markers(monkeypatch, tmp_path, capsys):
+def test_dry_run_preserves_completed_run_provenance_status_and_markers(monkeypatch, tmp_path, capsys):
     from wulfrna.pipeline import execute
 
     workdir = tmp_path / "work"
@@ -335,12 +335,15 @@ def test_dry_run_with_changed_trimming_does_not_overwrite_manifest_or_markers(mo
     manifest_before = (workdir / "status/manifest.json").read_bytes()
     authoritative_params = b"completed run parameters\n"
     authoritative_versions = b"completed run versions\n"
+    authoritative_summary = b"completed run summary\n"
+    authoritative_finished_at = b"2026-01-01T00:00:00+00:00\n"
     (workdir / "logs").mkdir(exist_ok=True)
     (workdir / "metadata").mkdir(exist_ok=True)
     (workdir / "logs/run_parameters.txt").write_bytes(authoritative_params)
     (workdir / "metadata/versions.txt").write_bytes(authoritative_versions)
     (workdir / "status/SUCCESS").write_text("previous run\n", encoding="utf-8")
-    (workdir / "status/FAILED").write_text("stale failure\n", encoding="utf-8")
+    (workdir / "status/summary.txt").write_bytes(authoritative_summary)
+    (workdir / "status/finished_at.txt").write_bytes(authoritative_finished_at)
 
     args = parse_args(
         [
@@ -365,10 +368,13 @@ def test_dry_run_with_changed_trimming_does_not_overwrite_manifest_or_markers(mo
     assert all(step_done_file(workdir, phase).exists() for phase in PHASES if phase != "align")
     assert (workdir / "logs/run_parameters.txt").read_bytes() == authoritative_params
     assert (workdir / "metadata/versions.txt").read_bytes() == authoritative_versions
+    assert (workdir / "status/summary.txt").read_bytes() == authoritative_summary
+    assert (workdir / "status/finished_at.txt").read_bytes() == authoritative_finished_at
     assert (workdir / "logs/dry_run_parameters.txt").exists()
     assert (workdir / "metadata/dry_run_versions.txt").exists()
-    assert (workdir / "status/DRY_RUN_OK").exists()
-    assert not (workdir / "status/SUCCESS").exists()
+    assert (workdir / "status/dry_run/DRY_RUN_OK").exists()
+    assert (workdir / "status/dry_run/summary.txt").exists()
+    assert (workdir / "status/SUCCESS").exists()
     assert not (workdir / "status/FAILED").exists()
     assert "would invalidate cutadapt" in capsys.readouterr().out
 

@@ -172,7 +172,7 @@ wulfrna run <workdir> --reference <reference_dir> --stranded reverse --threads 4
 
 Notes:
 - These smoke commands use `--no-adapter-trimming` intentionally to validate setup only; production runs should use protocol-specific adapter sequences when removal is required.
-- For dry-run to pass, required binaries must be in `PATH`, references must be complete for the selected quantifier and optional aligner, and `<workdir>/fastq` must contain valid FASTQ inputs for the selected layout (`paired_end` or `single_end`). A dry run reports resume invalidation without replacing the authoritative execution manifest, `logs/run_parameters.txt`, or `metadata/versions.txt`; its invocation and versions are written to `logs/dry_run_parameters.txt` and `metadata/dry_run_versions.txt`.
+- For dry-run to pass, required binaries must be in `PATH`, references must be complete for the selected quantifier and optional aligner, and `<workdir>/fastq` must contain valid FASTQ inputs for the selected layout (`paired_end` or `single_end`). A dry run reports resume invalidation without replacing the authoritative execution manifest, status, `logs/run_parameters.txt`, or `metadata/versions.txt`; its invocation and versions are written to `logs/dry_run_parameters.txt` and `metadata/dry_run_versions.txt`, and its status is written under `status/dry_run/`.
 - Single-end examples:
   - Salmon: `wulfrna run WORKDIR --reference REFDIR --stranded reverse --threads 4 --single-end --adapter-r1 R1_SEQUENCE --dry-run`
   - kallisto: `wulfrna run WORKDIR --reference REFDIR --stranded reverse --threads 4 --single-end --quantifier kallisto --fragment-length 200 --fragment-sd 20 --adapter-r1 R1_SEQUENCE --dry-run`
@@ -205,7 +205,7 @@ Matrix behavior note:
 Status files in `WORKDIR/status/`:
 - during run: `RUNNING`
 - full success: `SUCCESS`, `finished_at.txt`, `summary.txt`
-- dry-run success: `DRY_RUN_OK`, `finished_at.txt`, `summary.txt`
+- dry-run state: `dry_run/RUNNING`, then `dry_run/DRY_RUN_OK` or `dry_run/FAILED`, with dry-run-specific details in the same subdirectory
 - failure: `FAILED`, `failed_step.txt` (and optionally `failed_sample.txt`), `summary.txt`
 - phase checkpoint markers: `status/steps/<phase>.done` for each completed phase
 - run compatibility manifest: `status/manifest.json`

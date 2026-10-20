@@ -265,6 +265,28 @@ def test_failed_adapter_change_leaves_cutadapt_and_downstream_incomplete(monkeyp
         assert not (workdir / f"status/steps/{phase}.done").exists()
 
 
+def test_dry_run_after_success_preserves_authoritative_status(monkeypatch, tmp_path):
+    workdir = run_pipeline(tmp_path, monkeypatch, single_end=False)
+    reference = tmp_path / "ref"
+    status_dir = workdir / "status"
+    authoritative_files = {
+        filename: (status_dir / filename).read_bytes()
+        for filename in ["SUCCESS", "finished_at.txt", "summary.txt"]
+    }
+
+    args = parse_args([
+        "run", str(workdir), "--reference", str(reference), "--stranded", "reverse", "--threads", "2",
+        "--aligner", "star", "--no-adapter-trimming", "--dry-run",
+    ])
+    assert execute(args) == 0
+
+    for filename, contents in authoritative_files.items():
+        assert (status_dir / filename).read_bytes() == contents
+    assert not (status_dir / "RUNNING").exists()
+    assert (status_dir / "dry_run/DRY_RUN_OK").exists()
+    assert (status_dir / "dry_run/summary.txt").exists()
+
+
 def test_missing_manifest_invalidates_unverified_cutadapt_and_downstream(monkeypatch, tmp_path, capsys):
     import json
 
@@ -348,7 +370,7 @@ def test_star_tools_required_when_aligner_star(monkeypatch, tmp_path):
     ])
 
     assert execute(args) == 1
-    assert (workdir / "status" / "failed_step.txt").read_text(encoding="utf-8") == "tool_check\n"
+    assert (workdir / "status/dry_run/failed_step.txt").read_text(encoding="utf-8") == "tool_check\n"
 
 
 @pytest.mark.parametrize("quantifier", ["salmon", "kallisto"])

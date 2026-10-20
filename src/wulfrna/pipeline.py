@@ -730,9 +730,9 @@ def write_summary(
     failed_count: int,
     quantifier: str = "salmon",
     aligner: str = "none",
+    output_dir: Optional[Path] = None,
 ) -> None:
-    status_dir = workdir / "status"
-    out = status_dir / "summary.txt"
+    out = (output_dir or workdir / "status") / "summary.txt"
     with out.open("w", encoding="utf-8") as f:
         f.write(f"Pipeline status: {status}\n")
         f.write(f"Started: {started}\n")
@@ -1070,8 +1070,12 @@ def execute(args: argparse.Namespace) -> int:
     ensure_dirs(workdir)
 
     status_dir = workdir / "status"
-    clear_terminal_status(status_dir)
-    running = status_dir / "RUNNING"
+    attempt_status_dir = status_dir / "dry_run" if args.dry_run else status_dir
+    attempt_status_dir.mkdir(parents=True, exist_ok=True)
+    # Dry-runs only replace the previous dry-run report; authoritative execution
+    # status remains in the parent status directory.
+    clear_terminal_status(attempt_status_dir)
+    running = attempt_status_dir / "RUNNING"
     running.write_text(now_iso() + "\n", encoding="utf-8")
     started = now_iso()
 
@@ -1136,8 +1140,8 @@ def execute(args: argparse.Namespace) -> int:
                 print("[dry-run] would invalidate all phase checkpoints (--no-resume)")
             elif args.force_from is not None and auto_force_from is None:
                 print(f"[dry-run] would invalidate {args.force_from} and downstream phases (--force-from)")
-            (status_dir / "DRY_RUN_OK").write_text(now_iso() + "\n", encoding="utf-8")
-            (status_dir / "finished_at.txt").write_text(now_iso() + "\n", encoding="utf-8")
+            (attempt_status_dir / "DRY_RUN_OK").write_text(now_iso() + "\n", encoding="utf-8")
+            (attempt_status_dir / "finished_at.txt").write_text(now_iso() + "\n", encoding="utf-8")
             if running.exists():
                 running.unlink()
             write_summary(
@@ -1150,6 +1154,7 @@ def execute(args: argparse.Namespace) -> int:
                 0,
                 args.quantifier,
                 args.aligner,
+                output_dir=attempt_status_dir,
             )
             return 0
 
@@ -1270,8 +1275,8 @@ def execute(args: argparse.Namespace) -> int:
             if not path.exists():
                 raise PipelineError(f"Required output missing: {path}", step="final_validation")
 
-        (status_dir / "SUCCESS").write_text(now_iso() + "\n", encoding="utf-8")
-        (status_dir / "finished_at.txt").write_text(now_iso() + "\n", encoding="utf-8")
+        (attempt_status_dir / "SUCCESS").write_text(now_iso() + "\n", encoding="utf-8")
+        (attempt_status_dir / "finished_at.txt").write_text(now_iso() + "\n", encoding="utf-8")
         if running.exists():
             running.unlink()
         write_manifest(workdir, manifest)
@@ -1286,14 +1291,15 @@ def execute(args: argparse.Namespace) -> int:
             0,
             args.quantifier,
             args.aligner,
+            output_dir=attempt_status_dir,
         )
         return 0
 
     except PipelineError as e:
-        (status_dir / "FAILED").write_text(now_iso() + "\n", encoding="utf-8")
-        (status_dir / "failed_step.txt").write_text(e.step + "\n", encoding="utf-8")
+        (attempt_status_dir / "FAILED").write_text(now_iso() + "\n", encoding="utf-8")
+        (attempt_status_dir / "failed_step.txt").write_text(e.step + "\n", encoding="utf-8")
         if e.sample is not None:
-            (status_dir / "failed_sample.txt").write_text(e.sample + "\n", encoding="utf-8")
+            (attempt_status_dir / "failed_sample.txt").write_text(e.sample + "\n", encoding="utf-8")
 
         if running.exists():
             running.unlink()
@@ -1308,6 +1314,7 @@ def execute(args: argparse.Namespace) -> int:
             max(0, len(samples) - completed_samples),
             args.quantifier,
             args.aligner,
+            output_dir=attempt_status_dir,
         )
         print(f"ERROR: {e}", file=sys.stderr)
         return 1

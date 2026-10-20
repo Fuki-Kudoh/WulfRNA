@@ -141,7 +141,8 @@ run starts at the first incomplete phase. `--force-from cutadapt` uses the same
 marker invalidation rule. A dry run validates and reports the invalidation plan
 but does not overwrite the authoritative manifest, execution parameters, tool
 versions, or existing phase markers. It writes `logs/dry_run_parameters.txt` and
-`metadata/dry_run_versions.txt` instead. Starting any new attempt clears stale
+`metadata/dry_run_versions.txt` instead, and records status under
+`status/dry_run/`. Starting an actual execution clears stale authoritative
 terminal status files without removing resumable phase checkpoints.
 
 Failure handling:
@@ -172,8 +173,8 @@ STAR summary rows are excluded from matrices but retained in copied native files
 Status markers (`WORKDIR/status/`):
 - `RUNNING` while active
 - `SUCCESS` on complete run success
-- `DRY_RUN_OK` on dry-run success
 - `FAILED` on failure (+ `failed_step.txt`, optional `failed_sample.txt`)
 - `summary.txt` and `finished_at.txt` on terminal states
+- `dry_run/` contains the corresponding status and summary for the latest dry-run without replacing authoritative execution status
 - `steps/*.done` per completed phase
 - `manifest.json` for resume compatibility
