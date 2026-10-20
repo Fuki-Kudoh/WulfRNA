@@ -333,6 +333,14 @@ def test_dry_run_with_changed_trimming_does_not_overwrite_manifest_or_markers(mo
         mark_phase_done(workdir, phase)
     write_manifest(workdir, existing)
     manifest_before = (workdir / "status/manifest.json").read_bytes()
+    authoritative_params = b"completed run parameters\n"
+    authoritative_versions = b"completed run versions\n"
+    (workdir / "logs").mkdir(exist_ok=True)
+    (workdir / "metadata").mkdir(exist_ok=True)
+    (workdir / "logs/run_parameters.txt").write_bytes(authoritative_params)
+    (workdir / "metadata/versions.txt").write_bytes(authoritative_versions)
+    (workdir / "status/SUCCESS").write_text("previous run\n", encoding="utf-8")
+    (workdir / "status/FAILED").write_text("stale failure\n", encoding="utf-8")
 
     args = parse_args(
         [
@@ -355,6 +363,13 @@ def test_dry_run_with_changed_trimming_does_not_overwrite_manifest_or_markers(mo
 
     assert (workdir / "status/manifest.json").read_bytes() == manifest_before
     assert all(step_done_file(workdir, phase).exists() for phase in PHASES if phase != "align")
+    assert (workdir / "logs/run_parameters.txt").read_bytes() == authoritative_params
+    assert (workdir / "metadata/versions.txt").read_bytes() == authoritative_versions
+    assert (workdir / "logs/dry_run_parameters.txt").exists()
+    assert (workdir / "metadata/dry_run_versions.txt").exists()
+    assert (workdir / "status/DRY_RUN_OK").exists()
+    assert not (workdir / "status/SUCCESS").exists()
+    assert not (workdir / "status/FAILED").exists()
     assert "would invalidate cutadapt" in capsys.readouterr().out
 
 

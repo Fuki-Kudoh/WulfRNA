@@ -83,7 +83,7 @@ inconsistent gene names, and a gene occurring on multiple chromosomes are fatal.
 ## Pipeline behavior
 1. Validate the explicit adapter strategy, tools, references, and FASTQ inputs for the selected layout. Invalid adapter configuration is rejected by the CLI before execution-state files are modified.
 2. Record metadata (`samples.tsv`, run parameters, versions).
-3. If `--dry-run`, stop after validation and metadata/status writing.
+3. If `--dry-run`, stop after validation and separate dry-run metadata/status writing.
 4. Otherwise run:
    - FastQC on raw FASTQ
    - Cutadapt with every R1 adapter passed as a separate `-a` and every paired-end R2 adapter passed as a separate `-A`; explicit no-trimming mode passes no adapter options and records that decision in the log
@@ -127,6 +127,7 @@ Manifest compatibility rules:
 - layout mismatch between existing and current manifest => hard error (prevents silent paired-end/single-end mixing),
 - trimming mode or ordered R1/R2 adapter list change => preserve raw FastQC and rerun Cutadapt plus every downstream phase,
 - missing trimming metadata in a legacy manifest => treat previous trimming as unverified and rerun from Cutadapt,
+- completed Cutadapt or downstream checkpoints without a manifest => treat previous trimming as unverified and rerun from Cutadapt,
 - quantifier/reference_dir/stranded change => rerun quant and downstream,
 - aligner or STAR index path/content change => rerun align and downstream when STAR alignment is enabled,
 - `combined_tx2gene.tsv` fingerprint change => reuse quant, rerun aggregate + multiqc,
@@ -138,7 +139,10 @@ markers from the earliest invalidated phase onward. Therefore an interruption
 cannot make stale downstream products resumable under a new manifest; the next
 run starts at the first incomplete phase. `--force-from cutadapt` uses the same
 marker invalidation rule. A dry run validates and reports the invalidation plan
-but does not overwrite the authoritative manifest or remove existing markers.
+but does not overwrite the authoritative manifest, execution parameters, tool
+versions, or existing phase markers. It writes `logs/dry_run_parameters.txt` and
+`metadata/dry_run_versions.txt` instead. Starting any new attempt clears stale
+terminal status files without removing resumable phase checkpoints.
 
 Failure handling:
 - failed phase does not get a `.done` marker,

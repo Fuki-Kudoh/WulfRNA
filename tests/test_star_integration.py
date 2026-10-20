@@ -258,9 +258,36 @@ def test_failed_adapter_change_leaves_cutadapt_and_downstream_incomplete(monkeyp
     monkeypatch.setattr(pipeline, "run_cmd", fail_cutadapt)
     assert execute(args) == 1
 
+    assert not (workdir / "status/SUCCESS").exists()
+    assert (workdir / "status/FAILED").exists()
     assert (workdir / "status/steps/fastqc_raw.done").exists()
     for phase in ["cutadapt", "fastqc_trimmed", "align", "quant", "aggregate", "multiqc"]:
         assert not (workdir / f"status/steps/{phase}.done").exists()
+
+
+def test_missing_manifest_invalidates_unverified_cutadapt_and_downstream(monkeypatch, tmp_path, capsys):
+    import json
+
+    workdir = run_pipeline(tmp_path, monkeypatch, single_end=False)
+    reference = tmp_path / "ref"
+    (workdir / "status/manifest.json").unlink()
+    raw_marker = workdir / "status/steps/fastqc_raw.done"
+    raw_marker.write_text("safe raw checkpoint\n", encoding="utf-8")
+
+    args = parse_args([
+        "run", str(workdir), "--reference", str(reference), "--stranded", "reverse", "--threads", "2",
+        "--aligner", "star", "--adapter-r1", "AAAA", "--adapter-r2", "CCCC",
+    ])
+    assert execute(args) == 0
+
+    assert raw_marker.read_text(encoding="utf-8") == "safe raw checkpoint\n"
+    cutadapt_log = (workdir / "logs/steps/sample.cutadapt.log").read_text(encoding="utf-8")
+    assert "-a AAAA" in cutadapt_log
+    assert "-A CCCC" in cutadapt_log
+    manifest = json.loads((workdir / "status/manifest.json").read_text(encoding="utf-8"))
+    assert manifest["trimming"]["adapters_r1"] == ["AAAA"]
+    assert manifest["trimming"]["adapters_r2"] == ["CCCC"]
+    assert "completed phases lack an authoritative manifest" in capsys.readouterr().out
 
 
 def test_star_tools_not_required_when_aligner_omitted(monkeypatch, tmp_path):

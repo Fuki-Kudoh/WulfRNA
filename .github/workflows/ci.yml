@@ -25,6 +25,10 @@ jobs:
       - name: Install package
         run: pip install -e .[test]
 
+      - name: Install Cutadapt integration dependency
+        if: matrix.python-version == '3.11'
+        run: pip install 'cutadapt==5.2'
+
       - name: Compile package
         run: python -m compileall src/wulfrna
 

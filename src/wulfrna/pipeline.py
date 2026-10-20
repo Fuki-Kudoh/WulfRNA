@@ -20,6 +20,15 @@ LAYOUT_PAIRED = "paired_end"
 LAYOUT_SINGLE = "single_end"
 TRIMMING_ADAPTERS = "adapters"
 TRIMMING_DISABLED = "disabled"
+TERMINAL_STATUS_FILES = [
+    "SUCCESS",
+    "FAILED",
+    "DRY_RUN_OK",
+    "finished_at.txt",
+    "failed_step.txt",
+    "failed_sample.txt",
+    "summary.txt",
+]
 
 
 STAR_INDEX_REQUIRED_FILES = [
@@ -390,16 +399,18 @@ def validate_cutadapt_outputs(workdir: Path, sample: Sample, layout: str, trimmi
         raise PipelineError(str(exc), step=exc.step, sample=sample.sample_id) from exc
 
 
-def write_params(workdir: Path, args: argparse.Namespace) -> None:
-    out = workdir / "logs" / "run_parameters.txt"
+def write_params(workdir: Path, args: argparse.Namespace, dry_run: bool = False) -> None:
+    filename = "dry_run_parameters.txt" if dry_run else "run_parameters.txt"
+    out = workdir / "logs" / filename
     out.parent.mkdir(parents=True, exist_ok=True)
     with out.open("w", encoding="utf-8") as f:
         for k, v in vars(args).items():
             f.write(f"{k}: {v}\n")
 
 
-def capture_versions(workdir: Path) -> None:
-    capture_versions_file(workdir / "metadata" / "versions.txt")
+def capture_versions(workdir: Path, dry_run: bool = False) -> None:
+    filename = "dry_run_versions.txt" if dry_run else "versions.txt"
+    capture_versions_file(workdir / "metadata" / filename)
 
 
 def parse_tx2gene(tx2gene_tsv: Path) -> Dict[str, str]:
@@ -791,6 +802,12 @@ def invalidate_phase_markers(workdir: Path, from_phase: str) -> None:
         step_done_file(workdir, phase).unlink(missing_ok=True)
 
 
+def clear_terminal_status(status_dir: Path) -> None:
+    """Remove terminal state from a previous attempt without disturbing phase checkpoints."""
+    for filename in TERMINAL_STATUS_FILES:
+        (status_dir / filename).unlink(missing_ok=True)
+
+
 def output_exists_nonempty(path: Path) -> bool:
     return path.exists() and path.is_file() and path.stat().st_size > 0
 
@@ -1053,6 +1070,7 @@ def execute(args: argparse.Namespace) -> int:
     ensure_dirs(workdir)
 
     status_dir = workdir / "status"
+    clear_terminal_status(status_dir)
     running = status_dir / "RUNNING"
     running.write_text(now_iso() + "\n", encoding="utf-8")
     started = now_iso()
@@ -1072,8 +1090,8 @@ def execute(args: argparse.Namespace) -> int:
         tx2gene_map = parse_tx2gene(refs["tx2gene"])
         gene_annotations = parse_gene_annotation(refs["gene_annotation"])
         validate_gene_resource_consistency(tx2gene_map, gene_annotations)
-        write_params(workdir, args)
-        capture_versions(workdir)
+        write_params(workdir, args, dry_run=args.dry_run)
+        capture_versions(workdir, dry_run=args.dry_run)
 
         manifest: Dict[str, object] = {
             "workdir": str(workdir),
@@ -1099,9 +1117,13 @@ def execute(args: argparse.Namespace) -> int:
         manifest_reasons: List[str] = []
         if existing_manifest is not None:
             auto_force_from, manifest_reasons = compare_manifest(existing_manifest, manifest)
-            if auto_force_from is not None:
-                prefix = "[dry-run] would invalidate" if args.dry_run else "[force]"
-                print(f"{prefix} {auto_force_from} (manifest: {', '.join(manifest_reasons)})")
+        elif any(step_done_file(workdir, phase).exists() for phase in PHASES[phase_index("cutadapt") :]):
+            auto_force_from = "cutadapt"
+            manifest_reasons = ["completed phases lack an authoritative manifest"]
+
+        if auto_force_from is not None:
+            prefix = "[dry-run] would invalidate" if args.dry_run else "[force]"
+            print(f"{prefix} {auto_force_from} (manifest: {', '.join(manifest_reasons)})")
 
         effective_force_from = args.force_from
         if auto_force_from is not None and (

@@ -119,7 +119,7 @@ Arguments:
 - `--no-adapter-trimming`: explicitly preserve the Cutadapt phase without removing adapters
 - `--fragment-length FLOAT` and `--fragment-sd FLOAT` (single-end kallisto only; both required and must be `> 0`)
 - `--min-mapping-rate FLOAT` (optional, default `0.90`): minimum acceptable tx2gene transcript mapping rate per sample (`0.0-1.0`)
-- `--dry-run` (optional): validate tools/reference/inputs, write metadata/status, then exit
+- `--dry-run` (optional): validate tools/reference/inputs, write separate dry-run metadata/status, then exit
 - `--genome NAME` (optional): resolve references as `<reference>/<NAME>/...`
 - `--no-resume` (optional): disable phase-level resume and rerun all phases
 - `--force-from {fastqc_raw,cutadapt,fastqc_trimmed,align,quant,aggregate,multiqc}` (optional): force rerun from the selected phase onward
@@ -172,7 +172,7 @@ wulfrna run <workdir> --reference <reference_dir> --stranded reverse --threads 4
 
 Notes:
 - These smoke commands use `--no-adapter-trimming` intentionally to validate setup only; production runs should use protocol-specific adapter sequences when removal is required.
-- For dry-run to pass, required binaries must be in `PATH`, references must be complete for the selected quantifier and optional aligner, and `<workdir>/fastq` must contain valid FASTQ inputs for the selected layout (`paired_end` or `single_end`). A dry run reports resume invalidation without replacing the authoritative execution manifest.
+- For dry-run to pass, required binaries must be in `PATH`, references must be complete for the selected quantifier and optional aligner, and `<workdir>/fastq` must contain valid FASTQ inputs for the selected layout (`paired_end` or `single_end`). A dry run reports resume invalidation without replacing the authoritative execution manifest, `logs/run_parameters.txt`, or `metadata/versions.txt`; its invocation and versions are written to `logs/dry_run_parameters.txt` and `metadata/dry_run_versions.txt`.
 - Single-end examples:
   - Salmon: `wulfrna run WORKDIR --reference REFDIR --stranded reverse --threads 4 --single-end --adapter-r1 R1_SEQUENCE --dry-run`
   - kallisto: `wulfrna run WORKDIR --reference REFDIR --stranded reverse --threads 4 --single-end --quantifier kallisto --fragment-length 200 --fragment-sd 20 --adapter-r1 R1_SEQUENCE --dry-run`
@@ -231,7 +231,7 @@ A phase is skipped only when:
 Conservative compatibility rules:
 - If sample IDs changed: resume is blocked with an error.
 - If input layout changed (`paired_end` vs `single_end`): automatic resume is blocked with an error.
-- If the adapter mode or either ordered adapter list changed, or if a legacy manifest lacks trimming metadata: `cutadapt` and every downstream phase rerun; `fastqc_raw` remains reusable.
+- If the adapter mode or either ordered adapter list changed, if a legacy manifest lacks trimming metadata, or if completed Cutadapt/downstream checkpoints have no manifest: `cutadapt` and every downstream phase rerun; `fastqc_raw` remains reusable.
 - If `quantifier`, `reference_dir`, or `stranded` changed: `quant` and downstream phases rerun.
 - If `aligner` or STAR index content changed: `align` and downstream phases rerun when STAR alignment is enabled.
 - If `combined_tx2gene.tsv` fingerprint changed: `aggregate` and `multiqc` rerun.
