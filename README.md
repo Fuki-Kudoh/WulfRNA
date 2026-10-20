@@ -97,8 +97,12 @@ between this table, `combined_tx2gene.tsv`, and STAR.
 ## 4) Run command
 
 ```bash
-wulfrna run WORKDIR --reference /path/to/reference --stranded reverse --threads 16
+wulfrna run WORKDIR --reference /path/to/reference --stranded reverse --threads 16 \
+  --adapter-r1 R1_SEQUENCE --adapter-r2 R2_SEQUENCE
 ```
+
+`R1_SEQUENCE` and `R2_SEQUENCE` are placeholders. Replace them with the regular
+3′ adapter sequences specified by the library preparation protocol.
 
 Arguments:
 - `WORKDIR` (positional): working directory containing `fastq/`
@@ -110,6 +114,9 @@ Arguments:
 - `--quantifier {salmon|kallisto}` (optional, default `salmon`)
 - `--aligner {none|star}` (optional, default `none`): run STAR alignment from trimmed FASTQs and write isolated alignment outputs under `align/star/<sample>/`; Salmon/kallisto quantification and abundance matrices are still produced normally
 - `--single-end`, `--SE` (optional): switch layout from `paired_end` to `single_end`
+- `--adapter-r1 SEQUENCE` (repeatable): regular 3′ adapter candidate for read 1
+- `--adapter-r2 SEQUENCE` (repeatable, paired-end only): regular 3′ adapter candidate for read 2
+- `--no-adapter-trimming`: explicitly preserve the Cutadapt phase without removing adapters
 - `--fragment-length FLOAT` and `--fragment-sd FLOAT` (single-end kallisto only; both required and must be `> 0`)
 - `--min-mapping-rate FLOAT` (optional, default `0.90`): minimum acceptable tx2gene transcript mapping rate per sample (`0.0-1.0`)
 - `--dry-run` (optional): validate tools/reference/inputs, write metadata/status, then exit
@@ -119,21 +126,56 @@ Arguments:
 
 Backward-compatibility note: legacy invocation without explicit `run` is still accepted, but `wulfrna run ...` is the intended interface.
 
+### Adapter configuration (required)
+
+Every run must choose exactly one explicit trimming strategy:
+
+- Paired-end: provide at least one `--adapter-r1` and at least one `--adapter-r2`.
+- Single-end: provide at least one `--adapter-r1`; `--adapter-r2` is rejected.
+- Intentional adapter-free processing: provide `--no-adapter-trimming` and no adapter sequences.
+
+Repeat an adapter option to test multiple protocol-appropriate candidates:
+
+```bash
+wulfrna run WORKDIR --reference REFDIR --stranded reverse --threads 8 \
+  --adapter-r1 R1_SEQUENCE_1 --adapter-r1 R1_SEQUENCE_2 \
+  --adapter-r2 R2_SEQUENCE_1 --adapter-r2 R2_SEQUENCE_2
+```
+
+Single-end example:
+
+```bash
+wulfrna run WORKDIR --reference REFDIR --stranded reverse --threads 8 \
+  --single-end --adapter-r1 R1_SEQUENCE
+```
+
+Sequences are case-normalized and must contain only supported IUPAC DNA codes.
+Advanced Cutadapt expressions, linked/anchored adapters, and presets are not
+supported. Choose sequences from the library preparation protocol: a FastQC
+adapter label does not establish the correct complete sequence, and WulfRNA does
+not silently substitute a generic Illumina or Nextera adapter.
+
+**Migration requirement:** runs that previously omitted adapter options must now
+provide explicit sequences or `--no-adapter-trimming`. Existing work directories
+whose manifests do not contain verified trimming metadata are invalidated from
+Cutadapt onward; raw FastQC output remains reusable.
+
 ## 5) Minimal smoke test plan
 
 ```bash
 pip install -e .
 wulfrna --help
-wulfrna run <workdir> --reference <reference_dir> --stranded reverse --threads 4 --dry-run
-wulfrna run <workdir> --reference <reference_dir> --stranded reverse --threads 4 --quantifier kallisto --dry-run
-wulfrna run <workdir> --reference <reference_dir> --stranded reverse --threads 4 --aligner star --dry-run
+wulfrna run <workdir> --reference <reference_dir> --stranded reverse --threads 4 --no-adapter-trimming --dry-run
+wulfrna run <workdir> --reference <reference_dir> --stranded reverse --threads 4 --quantifier kallisto --no-adapter-trimming --dry-run
+wulfrna run <workdir> --reference <reference_dir> --stranded reverse --threads 4 --aligner star --no-adapter-trimming --dry-run
 ```
 
 Notes:
-- For dry-run to pass, required binaries must be in `PATH`, references must be complete for the selected quantifier and optional aligner, and `<workdir>/fastq` must contain valid FASTQ inputs for the selected layout (`paired_end` or `single_end`).
+- These smoke commands use `--no-adapter-trimming` intentionally to validate setup only; production runs should use protocol-specific adapter sequences when removal is required.
+- For dry-run to pass, required binaries must be in `PATH`, references must be complete for the selected quantifier and optional aligner, and `<workdir>/fastq` must contain valid FASTQ inputs for the selected layout (`paired_end` or `single_end`). A dry run reports resume invalidation without replacing the authoritative execution manifest.
 - Single-end examples:
-  - Salmon: `wulfrna run WORKDIR --reference REFDIR --stranded reverse --threads 4 --single-end --dry-run`
-  - kallisto: `wulfrna run WORKDIR --reference REFDIR --stranded reverse --threads 4 --single-end --quantifier kallisto --fragment-length 200 --fragment-sd 20 --dry-run`
+  - Salmon: `wulfrna run WORKDIR --reference REFDIR --stranded reverse --threads 4 --single-end --adapter-r1 R1_SEQUENCE --dry-run`
+  - kallisto: `wulfrna run WORKDIR --reference REFDIR --stranded reverse --threads 4 --single-end --quantifier kallisto --fragment-length 200 --fragment-sd 20 --adapter-r1 R1_SEQUENCE --dry-run`
 
 ## 6) Main outputs and status markers
 
@@ -189,6 +231,7 @@ A phase is skipped only when:
 Conservative compatibility rules:
 - If sample IDs changed: resume is blocked with an error.
 - If input layout changed (`paired_end` vs `single_end`): automatic resume is blocked with an error.
+- If the adapter mode or either ordered adapter list changed, or if a legacy manifest lacks trimming metadata: `cutadapt` and every downstream phase rerun; `fastqc_raw` remains reusable.
 - If `quantifier`, `reference_dir`, or `stranded` changed: `quant` and downstream phases rerun.
 - If `aligner` or STAR index content changed: `align` and downstream phases rerun when STAR alignment is enabled.
 - If `combined_tx2gene.tsv` fingerprint changed: `aggregate` and `multiqc` rerun.
@@ -198,8 +241,15 @@ Conservative compatibility rules:
 To fully disable resume:
 
 ```bash
-wulfrna run WORKDIR --reference REFDIR --stranded reverse --threads 16 --no-resume
+wulfrna run WORKDIR --reference REFDIR --stranded reverse --threads 16 \
+  --adapter-r1 R1_SEQUENCE --adapter-r2 R2_SEQUENCE --no-resume
 ```
+
+To explicitly rebuild trimmed reads and all dependent outputs with the same
+configuration, use `--force-from cutadapt`. WulfRNA clears the Cutadapt and
+downstream phase markers before recording new execution provenance, so an
+interrupted rerun resumes at the first incomplete phase without accepting stale
+outputs.
 
 To rerun only aggregation/reporting after fixing `combined_tx2gene.tsv`:
 - preferred: `--force-from aggregate`, or
@@ -208,7 +258,8 @@ To rerun only aggregation/reporting after fixing `combined_tx2gene.tsv`:
 Example:
 
 ```bash
-wulfrna run WORKDIR --reference REFDIR --stranded reverse --threads 16 --force-from aggregate
+wulfrna run WORKDIR --reference REFDIR --stranded reverse --threads 16 \
+  --adapter-r1 R1_SEQUENCE --adapter-r2 R2_SEQUENCE --force-from aggregate
 ```
 
 ## 8) Citation

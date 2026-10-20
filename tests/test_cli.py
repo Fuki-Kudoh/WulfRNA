@@ -13,6 +13,7 @@ def base_args():
         "reverse",
         "--threads",
         "4",
+        "--no-adapter-trimming",
     ]
 
 
@@ -25,6 +26,7 @@ def test_aligner_defaults_to_none_preserving_legacy_invocation():
         "reverse",
         "--threads",
         "4",
+        "--no-adapter-trimming",
     ])
 
     assert args.command == "run"

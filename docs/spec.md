@@ -8,7 +8,7 @@ Paired-end FASTQ input is the default, and single-end FASTQ input is supported w
 Primary command:
 
 ```bash
-wulfrna run WORKDIR --reference REFDIR --stranded {none|forward|reverse} --threads N [--quantifier {salmon|kallisto}] [--aligner {none|star}] [--single-end|--SE] [--fragment-length FLOAT] [--fragment-sd FLOAT] [--dry-run] [--genome NAME]
+wulfrna run WORKDIR --reference REFDIR --stranded {none|forward|reverse} --threads N (--adapter-r1 SEQUENCE [--adapter-r1 SEQUENCE ...] [--adapter-r2 SEQUENCE ...] | --no-adapter-trimming) [--quantifier {salmon|kallisto}] [--aligner {none|star}] [--single-end|--SE] [--fragment-length FLOAT] [--fragment-sd FLOAT] [--dry-run] [--genome NAME]
 ```
 
 - `WORKDIR` must contain `fastq/` using the selected input layout.
@@ -17,6 +17,9 @@ wulfrna run WORKDIR --reference REFDIR --stranded {none|forward|reverse} --threa
 - `--quantifier` defaults to `salmon` and selects the transcript quantification backend.
 - `--aligner` defaults to `none`; `--aligner star` runs STAR from trimmed FASTQs and writes isolated outputs under `align/star/<sample>/` while preserving Salmon/kallisto quantification outputs.
 - `--single-end` / `--SE` enables single-end input; paired-end is the default.
+- `--adapter-r1` and `--adapter-r2` provide regular 3′ Cutadapt adapter sequences and are repeatable. Paired-end runs require at least one of each; single-end runs require R1 and reject R2.
+- `--no-adapter-trimming` is the only supported way to run intentionally without adapter removal and conflicts with adapter sequence options.
+- Adapter sequences are case-normalized IUPAC DNA strings. Advanced Cutadapt expressions, automatic discovery, and adapter presets are outside the supported interface.
 - `--fragment-length` and `--fragment-sd` are required only for single-end kallisto runs and must be positive.
 - `--no-resume` disables automatic phase-level resume.
 - `--force-from` forces rerun from one phase onward (`fastqc_raw`, `cutadapt`, `fastqc_trimmed`, `align`, `quant`, `aggregate`, `multiqc`).
@@ -78,18 +81,23 @@ Missing `gene_name` becomes `NA`. Malformed exon records, invalid coordinates,
 inconsistent gene names, and a gene occurring on multiple chromosomes are fatal.
 
 ## Pipeline behavior
-1. Validate tools, references, and FASTQ inputs for the selected layout.
+1. Validate the explicit adapter strategy, tools, references, and FASTQ inputs for the selected layout. Invalid adapter configuration is rejected by the CLI before execution-state files are modified.
 2. Record metadata (`samples.tsv`, run parameters, versions).
 3. If `--dry-run`, stop after validation and metadata/status writing.
 4. Otherwise run:
    - FastQC on raw FASTQ
-   - Cutadapt trimming
+   - Cutadapt with every R1 adapter passed as a separate `-a` and every paired-end R2 adapter passed as a separate `-A`; explicit no-trimming mode passes no adapter options and records that decision in the log
    - FastQC on trimmed FASTQ
    - STAR alignment per sample when `--aligner star` is selected
    - Transcript quantification per sample (`salmon quant` or `kallisto quant`)
    - Aggregate transcript-level estimates to gene-level using `combined_tx2gene.tsv`
    - MultiQC over the work directory
-5. Verify required final outputs exist.
+5. Validate each Cutadapt JSON report against the requested adapter definitions (zero matches are allowed), verify required phase/final outputs exist, and reject malformed or missing reports.
+
+Adapter configuration is mandatory. Existing invocations must add protocol-specific
+adapter sequences or explicitly select `--no-adapter-trimming`. WulfRNA does not
+infer adapters from FastQC labels and does not provide generic Illumina/Nextera
+defaults.
 
 ### Phase-level checkpointing and resume
 
@@ -111,23 +119,32 @@ Resume is enabled by default. A phase is skipped only if:
 
 Machine-readable manifest:
 - `status/manifest.json`
-- Includes `workdir`, `reference_dir`, `quantifier`, `aligner`, `stranded`, `layout`, `sample_ids`, reference files used, tx2gene and gene-annotation fingerprints, STAR index fingerprint when applicable, `created_at`, `updated_at`.
+- Includes `workdir`, `reference_dir`, `quantifier`, `aligner`, `stranded`, `layout`, `sample_ids`, the effective trimming mode and ordered R1/R2 adapter lists, reference files used, tx2gene and gene-annotation fingerprints, STAR index fingerprint when applicable, `created_at`, `updated_at`.
 
 Manifest compatibility rules:
 - sample set change => hard error (no silent resume),
 - missing `layout` in old manifests is treated as `paired_end`,
 - layout mismatch between existing and current manifest => hard error (prevents silent paired-end/single-end mixing),
+- trimming mode or ordered R1/R2 adapter list change => preserve raw FastQC and rerun Cutadapt plus every downstream phase,
+- missing trimming metadata in a legacy manifest => treat previous trimming as unverified and rerun from Cutadapt,
 - quantifier/reference_dir/stranded change => rerun quant and downstream,
 - aligner or STAR index path/content change => rerun align and downstream when STAR alignment is enabled,
 - `combined_tx2gene.tsv` fingerprint change => reuse quant, rerun aggregate + multiqc,
 - `combined_gene_annotation.tsv` fingerprint change => reuse quant, rerun aggregate + multiqc,
 - threads-only changes are resumable.
 
+Before a normal run records changed provenance, it removes the affected phase
+markers from the earliest invalidated phase onward. Therefore an interruption
+cannot make stale downstream products resumable under a new manifest; the next
+run starts at the first incomplete phase. `--force-from cutadapt` uses the same
+marker invalidation rule. A dry run validates and reports the invalidation plan
+but does not overwrite the authoritative manifest or remove existing markers.
+
 Failure handling:
 - failed phase does not get a `.done` marker,
 - `status/FAILED` and `status/failed_step.txt` are written,
 - `status/failed_sample.txt` is written when sample context exists,
-- previously completed phase markers remain for future resume.
+- unaffected upstream phase markers remain for future resume; markers invalidated by a configuration change or `--force-from` stay absent until their phases complete successfully.
 
 ## Output contracts
 Primary outputs:

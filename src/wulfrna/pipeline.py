@@ -18,6 +18,8 @@ from .io import capture_versions_file, now_iso
 PHASES = ["fastqc_raw", "cutadapt", "fastqc_trimmed", "align", "quant", "aggregate", "multiqc"]
 LAYOUT_PAIRED = "paired_end"
 LAYOUT_SINGLE = "single_end"
+TRIMMING_ADAPTERS = "adapters"
+TRIMMING_DISABLED = "disabled"
 
 
 STAR_INDEX_REQUIRED_FILES = [
@@ -47,6 +49,20 @@ class Sample:
     r2: Optional[Path] = None
 
 
+@dataclass(frozen=True)
+class TrimmingConfig:
+    mode: str
+    adapters_r1: Tuple[str, ...]
+    adapters_r2: Tuple[str, ...]
+
+    def as_manifest(self) -> Dict[str, object]:
+        return {
+            "mode": self.mode,
+            "adapters_r1": list(self.adapters_r1),
+            "adapters_r2": list(self.adapters_r2),
+        }
+
+
 class PipelineError(Exception):
     def __init__(self, message: str, step: str, sample: Optional[str] = None):
         super().__init__(message)
@@ -54,9 +70,17 @@ class PipelineError(Exception):
         self.sample = sample
 
 
-def run_cmd(cmd: List[str], log_path: Path, step: str, sample: Optional[str] = None) -> None:
+def run_cmd(
+    cmd: List[str],
+    log_path: Path,
+    step: str,
+    sample: Optional[str] = None,
+    log_note: Optional[str] = None,
+) -> None:
     log_path.parent.mkdir(parents=True, exist_ok=True)
     with log_path.open("w", encoding="utf-8") as log:
+        if log_note is not None:
+            log.write(f"# {log_note}\n")
         log.write("$ " + " ".join(cmd) + "\n\n")
         proc = subprocess.run(cmd, stdout=log, stderr=subprocess.STDOUT)
     if proc.returncode != 0:
@@ -244,6 +268,126 @@ def detect_samples(workdir: Path, single_end: bool) -> Tuple[str, List[Sample]]:
                 w.writerow([sample.sample_id, str(sample.r1.relative_to(workdir)), str(sample.r2.relative_to(workdir))])
 
     return layout, sample_list
+
+
+def trimming_config_from_args(args: argparse.Namespace) -> TrimmingConfig:
+    mode = TRIMMING_DISABLED if args.no_adapter_trimming else TRIMMING_ADAPTERS
+    return TrimmingConfig(
+        mode=mode,
+        adapters_r1=tuple(args.adapter_r1 or []),
+        adapters_r2=tuple(args.adapter_r2 or []),
+    )
+
+
+def cutadapt_output_paths(workdir: Path, sample: Sample, layout: str) -> Tuple[List[Path], Path]:
+    report_path = workdir / "qc" / "cutadapt" / f"{sample.sample_id}.cutadapt.json"
+    if layout == LAYOUT_SINGLE:
+        trimmed = [workdir / "trimmed" / f"{sample.sample_id}.trimmed.fastq.gz"]
+    else:
+        trimmed = [
+            workdir / "trimmed" / f"{sample.sample_id}_R1.trimmed.fastq.gz",
+            workdir / "trimmed" / f"{sample.sample_id}_R2.trimmed.fastq.gz",
+        ]
+    return trimmed, report_path
+
+
+def build_cutadapt_command(
+    workdir: Path,
+    sample: Sample,
+    threads: int,
+    layout: str,
+    trimming: TrimmingConfig,
+) -> List[str]:
+    """Build a Cutadapt argument array without shell interpolation."""
+    cmd = ["cutadapt", "-j", str(max(1, threads // 2))]
+    if trimming.mode == TRIMMING_ADAPTERS:
+        for adapter in trimming.adapters_r1:
+            cmd.extend(["-a", adapter])
+        if layout == LAYOUT_PAIRED:
+            for adapter in trimming.adapters_r2:
+                cmd.extend(["-A", adapter])
+    elif trimming.mode != TRIMMING_DISABLED:
+        raise PipelineError(f"Unsupported trimming mode: {trimming.mode}", step="cutadapt", sample=sample.sample_id)
+
+    trimmed_paths, report_path = cutadapt_output_paths(workdir, sample, layout)
+    cmd.extend(["-o", str(trimmed_paths[0])])
+    if layout == LAYOUT_PAIRED:
+        cmd.extend(["-p", str(trimmed_paths[1])])
+    cmd.extend(["--json", str(report_path), str(sample.r1)])
+    if layout == LAYOUT_PAIRED and sample.r2 is not None:
+        cmd.append(str(sample.r2))
+    return cmd
+
+
+def _cutadapt_report_sequences(report: Dict[str, object], key: str, report_path: Path) -> List[str]:
+    if key not in report:
+        raise PipelineError(f"Cutadapt JSON report is missing {key}: {report_path}", step="cutadapt")
+    definitions = report[key]
+    if definitions is None:
+        definitions = []
+    if not isinstance(definitions, list):
+        raise PipelineError(f"Cutadapt JSON field {key} must be an array: {report_path}", step="cutadapt")
+
+    sequences: List[str] = []
+    for index, definition in enumerate(definitions, start=1):
+        sequence: object = None
+        if isinstance(definition, dict):
+            sequence = definition.get("sequence")
+            if sequence is None:
+                three_prime_end = definition.get("three_prime_end")
+                if isinstance(three_prime_end, dict):
+                    sequence = three_prime_end.get("sequence")
+        if not isinstance(sequence, str):
+            raise PipelineError(
+                f"Cutadapt JSON field {key} has a malformed adapter definition at position {index}: {report_path}",
+                step="cutadapt",
+            )
+        sequences.append(sequence.upper())
+    return sequences
+
+
+def validate_cutadapt_report(report_path: Path, trimming: TrimmingConfig, layout: str) -> None:
+    if not output_exists_nonempty(report_path):
+        raise PipelineError(f"Cutadapt JSON report is missing or empty: {report_path}", step="cutadapt")
+    try:
+        with report_path.open("r", encoding="utf-8") as f:
+            report = json.load(f)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise PipelineError(f"Cutadapt JSON report is invalid ({exc}): {report_path}", step="cutadapt") from exc
+    if not isinstance(report, dict):
+        raise PipelineError(f"Cutadapt JSON report must contain an object: {report_path}", step="cutadapt")
+
+    actual_r1 = _cutadapt_report_sequences(report, "adapters_read1", report_path)
+    actual_r2 = _cutadapt_report_sequences(report, "adapters_read2", report_path)
+    expected_r1 = list(trimming.adapters_r1) if trimming.mode == TRIMMING_ADAPTERS else []
+    expected_r2 = list(trimming.adapters_r2) if trimming.mode == TRIMMING_ADAPTERS and layout == LAYOUT_PAIRED else []
+    if actual_r1 != expected_r1:
+        raise PipelineError(
+            f"Cutadapt JSON R1 adapter definitions do not match the requested configuration "
+            f"(expected={expected_r1}, actual={actual_r1}): {report_path}",
+            step="cutadapt",
+        )
+    if actual_r2 != expected_r2:
+        raise PipelineError(
+            f"Cutadapt JSON R2 adapter definitions do not match the requested configuration "
+            f"(expected={expected_r2}, actual={actual_r2}): {report_path}",
+            step="cutadapt",
+        )
+
+
+def validate_cutadapt_outputs(workdir: Path, sample: Sample, layout: str, trimming: TrimmingConfig) -> None:
+    trimmed_paths, report_path = cutadapt_output_paths(workdir, sample, layout)
+    missing = [str(path) for path in trimmed_paths if not output_exists_nonempty(path)]
+    if missing:
+        raise PipelineError(
+            "Cutadapt did not produce required non-empty output files: " + ", ".join(missing),
+            step="cutadapt",
+            sample=sample.sample_id,
+        )
+    try:
+        validate_cutadapt_report(report_path, trimming, layout)
+    except PipelineError as exc:
+        raise PipelineError(str(exc), step=exc.step, sample=sample.sample_id) from exc
 
 
 def write_params(workdir: Path, args: argparse.Namespace) -> None:
@@ -641,6 +785,12 @@ def mark_phase_done(workdir: Path, phase: str) -> None:
     step_done_file(workdir, phase).write_text(now_iso() + "\n", encoding="utf-8")
 
 
+def invalidate_phase_markers(workdir: Path, from_phase: str) -> None:
+    """Invalidate a phase and every downstream phase before recording new provenance."""
+    for phase in PHASES[phase_index(from_phase) :]:
+        step_done_file(workdir, phase).unlink(missing_ok=True)
+
+
 def output_exists_nonempty(path: Path) -> bool:
     return path.exists() and path.is_file() and path.stat().st_size > 0
 
@@ -731,10 +881,8 @@ def phase_outputs(
                 outputs.append(outdir / f"{prefix}_fastqc.zip")
     elif phase == "cutadapt":
         for sample in samples:
-            if layout == LAYOUT_SINGLE:
-                outputs.extend([workdir / "trimmed" / f"{sample.sample_id}.trimmed.fastq.gz", workdir / "qc" / "cutadapt" / f"{sample.sample_id}.cutadapt.json"])
-            else:
-                outputs.extend([workdir / "trimmed" / f"{sample.sample_id}_R1.trimmed.fastq.gz", workdir / "trimmed" / f"{sample.sample_id}_R2.trimmed.fastq.gz", workdir / "qc" / "cutadapt" / f"{sample.sample_id}.cutadapt.json"])
+            trimmed_paths, report_path = cutadapt_output_paths(workdir, sample, layout)
+            outputs.extend([*trimmed_paths, report_path])
     elif phase == "fastqc_trimmed":
         outdir = workdir / "qc" / "fastqc_trimmed"
         for sample in samples:
@@ -855,6 +1003,11 @@ def compare_manifest(existing: Dict[str, object], current: Dict[str, object]) ->
         force_from("quant", "reference_dir changed")
     if existing.get("stranded") != current.get("stranded"):
         force_from("quant", "stranded changed")
+    if existing.get("trimming") != current.get("trimming"):
+        if "trimming" not in existing:
+            force_from("cutadapt", "legacy manifest lacks verified trimming configuration")
+        else:
+            force_from("cutadapt", "trimming configuration changed")
     if existing.get("aligner", "none") != current.get("aligner", "none"):
         force_from("align", "aligner changed")
     existing_reference_files = existing.get("reference_files", {})
@@ -893,6 +1046,7 @@ def should_run_phase(
 
 
 def execute(args: argparse.Namespace) -> int:
+    trimming = trimming_config_from_args(args)
     workdir = Path(args.workdir).resolve()
     reference_root = Path(args.reference).resolve()
     workdir.mkdir(parents=True, exist_ok=True)
@@ -928,6 +1082,7 @@ def execute(args: argparse.Namespace) -> int:
             "stranded": args.stranded,
             "aligner": args.aligner,
             "layout": layout,
+            "trimming": trimming.as_manifest(),
             "sample_ids": [sample.sample_id for sample in samples],
             "reference_files": {
                 "index": str(refs["index"]),
@@ -945,10 +1100,20 @@ def execute(args: argparse.Namespace) -> int:
         if existing_manifest is not None:
             auto_force_from, manifest_reasons = compare_manifest(existing_manifest, manifest)
             if auto_force_from is not None:
-                print(f"[force] {auto_force_from} (manifest: {', '.join(manifest_reasons)})")
-        write_manifest(workdir, manifest)
+                prefix = "[dry-run] would invalidate" if args.dry_run else "[force]"
+                print(f"{prefix} {auto_force_from} (manifest: {', '.join(manifest_reasons)})")
+
+        effective_force_from = args.force_from
+        if auto_force_from is not None and (
+            effective_force_from is None or phase_index(auto_force_from) < phase_index(effective_force_from)
+        ):
+            effective_force_from = auto_force_from
 
         if args.dry_run:
+            if args.no_resume:
+                print("[dry-run] would invalidate all phase checkpoints (--no-resume)")
+            elif args.force_from is not None and auto_force_from is None:
+                print(f"[dry-run] would invalidate {args.force_from} and downstream phases (--force-from)")
             (status_dir / "DRY_RUN_OK").write_text(now_iso() + "\n", encoding="utf-8")
             (status_dir / "finished_at.txt").write_text(now_iso() + "\n", encoding="utf-8")
             if running.exists():
@@ -966,11 +1131,11 @@ def execute(args: argparse.Namespace) -> int:
             )
             return 0
 
-        effective_force_from = args.force_from
-        if auto_force_from is not None and (
-            effective_force_from is None or phase_index(auto_force_from) < phase_index(effective_force_from)
-        ):
-            effective_force_from = auto_force_from
+        if args.no_resume:
+            invalidate_phase_markers(workdir, "fastqc_raw")
+        elif effective_force_from is not None:
+            invalidate_phase_markers(workdir, effective_force_from)
+        write_manifest(workdir, manifest)
 
         quant_map: Dict[str, Path] = {}
         for phase in selected_phases(args.aligner):
@@ -998,15 +1163,21 @@ def execute(args: argparse.Namespace) -> int:
                     )
             elif phase == "cutadapt":
                 for sample in samples:
-                    cmd = ["cutadapt", "-j", str(max(1, args.threads // 2))]
-                    if layout == LAYOUT_SINGLE:
-                        cmd.extend(["-o", str(workdir / "trimmed" / f"{sample.sample_id}.trimmed.fastq.gz")])
-                    else:
-                        cmd.extend(["-o", str(workdir / "trimmed" / f"{sample.sample_id}_R1.trimmed.fastq.gz"), "-p", str(workdir / "trimmed" / f"{sample.sample_id}_R2.trimmed.fastq.gz")])
-                    cmd.extend(["--json", str(workdir / "qc/cutadapt" / f"{sample.sample_id}.cutadapt.json"), str(sample.r1)])
-                    if layout == LAYOUT_PAIRED and sample.r2 is not None:
-                        cmd.append(str(sample.r2))
-                    run_cmd(cmd, workdir / "logs/steps" / f"{sample.sample_id}.cutadapt.log", step="cutadapt", sample=sample.sample_id)
+                    cmd = build_cutadapt_command(workdir, sample, args.threads, layout, trimming)
+                    log_note = (
+                        "Adapter trimming explicitly disabled by --no-adapter-trimming; "
+                        "Cutadapt is preserving the trimming phase without adapter removal."
+                        if trimming.mode == TRIMMING_DISABLED
+                        else None
+                    )
+                    run_cmd(
+                        cmd,
+                        workdir / "logs/steps" / f"{sample.sample_id}.cutadapt.log",
+                        step="cutadapt",
+                        sample=sample.sample_id,
+                        log_note=log_note,
+                    )
+                    validate_cutadapt_outputs(workdir, sample, layout, trimming)
             elif phase == "fastqc_trimmed":
                 for sample in samples:
                     trimmed_fastqs = [workdir / "trimmed" / f"{sample.sample_id}.trimmed.fastq.gz"] if layout == LAYOUT_SINGLE else [workdir / "trimmed" / f"{sample.sample_id}_R1.trimmed.fastq.gz", workdir / "trimmed" / f"{sample.sample_id}_R2.trimmed.fastq.gz"]

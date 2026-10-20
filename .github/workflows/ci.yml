@@ -46,6 +46,7 @@ jobs:
               '--reference', 'REFDIR',
               '--stranded', 'reverse',
               '--threads', '4',
+              '--no-adapter-trimming',
           ]
 
           paired = parse_args(base)

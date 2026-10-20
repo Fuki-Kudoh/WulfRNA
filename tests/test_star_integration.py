@@ -36,18 +36,21 @@ for item in args:
     write_executable(
         bin_dir / "cutadapt",
         r"""#!/usr/bin/env python3
+import json
 from pathlib import Path
 import sys
 args = sys.argv[1:]
-outputs = []
 for flag in ['-o', '-p']:
     if flag in args:
-        outputs.append(Path(args[args.index(flag) + 1]))
+        output = Path(args[args.index(flag) + 1])
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text('cutadapt\n', encoding='utf-8')
 if '--json' in args:
-    outputs.append(Path(args[args.index('--json') + 1]))
-for output in outputs:
+    output = Path(args[args.index('--json') + 1])
     output.parent.mkdir(parents=True, exist_ok=True)
-    output.write_text('cutadapt\n', encoding='utf-8')
+    adapters_r1 = [{'sequence': args[i + 1], 'total_matches': 0} for i, arg in enumerate(args) if arg == '-a']
+    adapters_r2 = [{'sequence': args[i + 1], 'total_matches': 0} for i, arg in enumerate(args) if arg == '-A']
+    output.write_text(json.dumps({'adapters_read1': adapters_r1, 'adapters_read2': adapters_r2}), encoding='utf-8')
 """,
     )
     write_executable(
@@ -126,7 +129,7 @@ def make_reference(ref_dir: Path) -> None:
         (star_index / name).write_text(f"{name}\n", encoding="utf-8")
 
 
-def run_pipeline(tmp_path, monkeypatch, single_end: bool, quantifier: str = "salmon"):
+def run_pipeline(tmp_path, monkeypatch, single_end: bool, quantifier: str = "salmon", adapter_args=None):
     bin_dir = tmp_path / "bin"
     workdir = tmp_path / "work"
     ref_dir = tmp_path / "ref"
@@ -158,6 +161,7 @@ def run_pipeline(tmp_path, monkeypatch, single_end: bool, quantifier: str = "sal
         "star",
         "--quantifier",
         quantifier,
+        *(adapter_args or ["--no-adapter-trimming"]),
         *layout_args,
     ])
 
@@ -209,6 +213,56 @@ def test_star_alignment_outputs_for_single_end(monkeypatch, tmp_path):
     assert_star_outputs(workdir)
 
 
+def test_adapter_configuration_is_logged_and_manifested(monkeypatch, tmp_path):
+    import json
+
+    workdir = run_pipeline(
+        tmp_path,
+        monkeypatch,
+        single_end=False,
+        adapter_args=["--adapter-r1", "AAAA", "--adapter-r2", "CCCC"],
+    )
+
+    cutadapt_log = (workdir / "logs/steps/sample.cutadapt.log").read_text(encoding="utf-8")
+    assert "-a AAAA" in cutadapt_log
+    assert "-A CCCC" in cutadapt_log
+    manifest = json.loads((workdir / "status/manifest.json").read_text(encoding="utf-8"))
+    assert manifest["trimming"] == {
+        "mode": "adapters",
+        "adapters_r1": ["AAAA"],
+        "adapters_r2": ["CCCC"],
+    }
+
+
+def test_explicit_no_trimming_is_clear_in_log(monkeypatch, tmp_path):
+    workdir = run_pipeline(tmp_path, monkeypatch, single_end=False)
+
+    cutadapt_log = (workdir / "logs/steps/sample.cutadapt.log").read_text(encoding="utf-8")
+    assert "Adapter trimming explicitly disabled by --no-adapter-trimming" in cutadapt_log
+
+
+def test_failed_adapter_change_leaves_cutadapt_and_downstream_incomplete(monkeypatch, tmp_path):
+    import wulfrna.pipeline as pipeline
+
+    workdir = run_pipeline(tmp_path, monkeypatch, single_end=False)
+    ref_dir = tmp_path / "ref"
+    args = parse_args([
+        "run", str(workdir), "--reference", str(ref_dir), "--stranded", "reverse", "--threads", "2",
+        "--aligner", "star", "--adapter-r1", "AAAA", "--adapter-r2", "CCCC",
+    ])
+
+    def fail_cutadapt(cmd, log_path, step, sample=None, log_note=None):
+        assert step == "cutadapt"
+        raise pipeline.PipelineError("simulated interruption", step=step, sample=sample)
+
+    monkeypatch.setattr(pipeline, "run_cmd", fail_cutadapt)
+    assert execute(args) == 1
+
+    assert (workdir / "status/steps/fastqc_raw.done").exists()
+    for phase in ["cutadapt", "fastqc_trimmed", "align", "quant", "aggregate", "multiqc"]:
+        assert not (workdir / f"status/steps/{phase}.done").exists()
+
+
 def test_star_tools_not_required_when_aligner_omitted(monkeypatch, tmp_path):
     bin_dir = tmp_path / "bin"
     workdir = tmp_path / "work"
@@ -231,6 +285,7 @@ def test_star_tools_not_required_when_aligner_omitted(monkeypatch, tmp_path):
         "reverse",
         "--threads",
         "2",
+        "--no-adapter-trimming",
         "--dry-run",
     ])
 
@@ -261,6 +316,7 @@ def test_star_tools_required_when_aligner_star(monkeypatch, tmp_path):
         "2",
         "--aligner",
         "star",
+        "--no-adapter-trimming",
         "--dry-run",
     ])
 
@@ -269,7 +325,7 @@ def test_star_tools_required_when_aligner_star(monkeypatch, tmp_path):
 
 
 @pytest.mark.parametrize("quantifier", ["salmon", "kallisto"])
-def test_v021_migration_and_annotation_resume_behavior(monkeypatch, tmp_path, quantifier):
+def test_legacy_annotation_manifest_resume_behavior(monkeypatch, tmp_path, quantifier):
     import json
     import wulfrna.pipeline as pipeline
 
@@ -278,11 +334,12 @@ def test_v021_migration_and_annotation_resume_behavior(monkeypatch, tmp_path, qu
     args = parse_args([
         "run", str(workdir), "--reference", str(ref_dir),
         "--stranded", "reverse", "--threads", "2", "--aligner", "star", "--quantifier", quantifier,
+        "--no-adapter-trimming",
     ])
 
-    # Model a completed v0.2.1 directory: phase markers and legacy matrices
-    # exist, but source-qualified/STAR aggregate products and annotation
-    # manifest fields do not.
+    # Model a completed directory whose manifest predates gene-annotation
+    # fingerprints: phase markers and legacy matrices exist, but newer
+    # source-qualified/STAR aggregate products do not.
     for path in [
         workdir / "abundance" / f"{quantifier}_gene_expected_counts.tsv",
         workdir / "abundance" / f"{quantifier}_gene_tpm.tsv",

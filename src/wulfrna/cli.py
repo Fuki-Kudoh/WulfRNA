@@ -1,10 +1,24 @@
 from __future__ import annotations
 
 import argparse
+import re
 import sys
 from typing import List, Optional
 
 from .pipeline import execute
+
+
+IUPAC_DNA_PATTERN = re.compile(r"^[ACGTRYSWKMBDHVN]+$", re.IGNORECASE)
+
+
+def adapter_sequence(value: str) -> str:
+    """Validate and normalize a regular 3' adapter sequence."""
+    if not value or not IUPAC_DNA_PATTERN.fullmatch(value):
+        raise argparse.ArgumentTypeError(
+            "adapter sequences must be non-empty and contain only supported IUPAC DNA codes "
+            "(A, C, G, T, R, Y, S, W, K, M, B, D, H, V, N)"
+        )
+    return value.upper()
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -34,6 +48,25 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser.add_argument("--single-end", "--SE", dest="single_end", action="store_true", help="Use single-end FASTQ input layout")
     run_parser.add_argument("--fragment-length", type=float, help="Single-end fragment length for kallisto")
     run_parser.add_argument("--fragment-sd", type=float, help="Single-end fragment length standard deviation for kallisto")
+    run_parser.add_argument(
+        "--adapter-r1",
+        action="append",
+        type=adapter_sequence,
+        metavar="SEQUENCE",
+        help="Regular 3' adapter for read 1 (repeat for multiple candidates)",
+    )
+    run_parser.add_argument(
+        "--adapter-r2",
+        action="append",
+        type=adapter_sequence,
+        metavar="SEQUENCE",
+        help="Regular 3' adapter for read 2 (repeat for multiple candidates; paired-end only)",
+    )
+    run_parser.add_argument(
+        "--no-adapter-trimming",
+        action="store_true",
+        help="Explicitly run Cutadapt without adapter removal",
+    )
     run_parser.add_argument("--dry-run", action="store_true", help="Validate inputs, write metadata, and exit without running analysis tools")
     run_parser.add_argument("--no-resume", action="store_true", help="Disable automatic phase-level resume and rerun all phases")
     run_parser.add_argument(
@@ -66,6 +99,23 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
             parser.error("--single-end --quantifier kallisto requires --fragment-length and --fragment-sd")
         if args.fragment_length <= 0 or args.fragment_sd <= 0:
             parser.error("--fragment-length and --fragment-sd must be > 0")
+    adapter_r1 = args.adapter_r1 or []
+    adapter_r2 = args.adapter_r2 or []
+    if args.no_adapter_trimming and (adapter_r1 or adapter_r2):
+        parser.error("--no-adapter-trimming cannot be combined with --adapter-r1 or --adapter-r2")
+    if args.single_end and adapter_r2:
+        parser.error("--adapter-r2 is not allowed with --single-end")
+    if not args.no_adapter_trimming:
+        if args.single_end and not adapter_r1:
+            parser.error(
+                "Adapter configuration is required. Supply --adapter-r1 for single-end data, "
+                "or explicitly specify --no-adapter-trimming."
+            )
+        if not args.single_end and (not adapter_r1 or not adapter_r2):
+            parser.error(
+                "Adapter configuration is required. Supply --adapter-r1 and --adapter-r2 for paired-end data, "
+                "or explicitly specify --no-adapter-trimming."
+            )
     return args
 
 
