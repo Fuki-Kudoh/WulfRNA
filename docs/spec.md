@@ -18,7 +18,7 @@ wulfrna run WORKDIR --reference REFDIR --stranded {none|forward|reverse} --threa
 - `--aligner` defaults to `none`; `--aligner star` runs STAR from trimmed FASTQs and writes isolated outputs under `align/star/<sample>/` while preserving Salmon/kallisto quantification outputs.
 - `--single-end` / `--SE` enables single-end input; paired-end is the default.
 - `--adapter-r1` and `--adapter-r2` provide regular 3′ Cutadapt adapter sequences and are repeatable. Paired-end runs require at least one of each; single-end runs require R1 and reject R2.
-- `--no-adapter-trimming` is the only supported way to run intentionally without adapter removal and conflicts with adapter sequence options.
+- `--no-adapter-trimming` is the only supported way to run intentionally without adapter removal and conflicts with adapter sequence options. It does not disable nonempty-read filtering.
 - Adapter sequences are case-normalized IUPAC DNA strings. Advanced Cutadapt expressions, automatic discovery, and adapter presets are outside the supported interface.
 - `--fragment-length` and `--fragment-sd` are required only for single-end kallisto runs and must be positive.
 - `--no-resume` disables automatic phase-level resume.
@@ -86,7 +86,7 @@ inconsistent gene names, and a gene occurring on multiple chromosomes are fatal.
 3. If `--dry-run`, stop after validation and separate dry-run metadata/status writing.
 4. Otherwise run:
    - FastQC on raw FASTQ
-   - Cutadapt with every R1 adapter passed as a separate `-a` and every paired-end R2 adapter passed as a separate `-A`; explicit no-trimming mode passes no adapter options and records that decision in the log
+   - Cutadapt with `--minimum-length 1`, every R1 adapter passed as a separate `-a`, and every paired-end R2 adapter passed as a separate `-A`; paired-end mode explicitly uses `--pair-filter=any`, while explicit no-trimming mode passes no adapter options but keeps the nonempty-read filter and records that decision in the log
    - FastQC on trimmed FASTQ
    - STAR alignment per sample when `--aligner star` is selected
    - Transcript quantification per sample (`salmon quant` or `kallisto quant`)
@@ -98,6 +98,11 @@ Adapter configuration is mandatory. Existing invocations must add protocol-speci
 adapter sequences or explicitly select `--no-adapter-trimming`. WulfRNA does not
 infer adapters from FastQC labels and does not provide generic Illumina/Nextera
 defaults.
+
+The fixed read-filtering policy removes zero-length reads after adapter
+processing. In paired-end mode, both mates are discarded when either mate is
+empty, preserving retained-pair ordering and synchronization. Single-end mode
+applies the same 1 nt minimum without a pair-filter setting.
 
 ### Phase-level checkpointing and resume
 
@@ -119,7 +124,7 @@ Resume is enabled by default. A phase is skipped only if:
 
 Machine-readable manifest:
 - `status/manifest.json`
-- Includes `workdir`, `reference_dir`, `quantifier`, `aligner`, `stranded`, `layout`, `sample_ids`, the effective trimming mode and ordered R1/R2 adapter lists, reference files used, tx2gene and gene-annotation fingerprints, STAR index fingerprint when applicable, `created_at`, `updated_at`.
+- Includes `workdir`, `reference_dir`, `quantifier`, `aligner`, `stranded`, `layout`, `sample_ids`, the effective trimming mode and ordered R1/R2 adapter lists, the read-filtering minimum length and layout-appropriate pair policy, reference files used, tx2gene and gene-annotation fingerprints, STAR index fingerprint when applicable, `created_at`, `updated_at`.
 
 Manifest compatibility rules:
 - sample set change => hard error (no silent resume),
@@ -127,6 +132,7 @@ Manifest compatibility rules:
 - layout mismatch between existing and current manifest => hard error (prevents silent paired-end/single-end mixing),
 - trimming mode or ordered R1/R2 adapter list change => preserve raw FastQC and rerun Cutadapt plus every downstream phase,
 - missing trimming metadata in a legacy manifest => treat previous trimming as unverified and rerun from Cutadapt,
+- read-filtering policy change or missing policy metadata in a legacy manifest => preserve raw FastQC and rerun Cutadapt plus every downstream phase,
 - completed Cutadapt or downstream checkpoints without a manifest => treat previous trimming as unverified and rerun from Cutadapt,
 - quantifier/reference_dir/stranded change => rerun quant and downstream,
 - aligner or STAR index path/content change => rerun align and downstream when STAR alignment is enabled,

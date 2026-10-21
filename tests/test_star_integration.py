@@ -239,6 +239,7 @@ def test_explicit_no_trimming_is_clear_in_log(monkeypatch, tmp_path):
 
     cutadapt_log = (workdir / "logs/steps/sample.cutadapt.log").read_text(encoding="utf-8")
     assert "Adapter trimming explicitly disabled by --no-adapter-trimming" in cutadapt_log
+    assert "minimum-length safety filtering remains active" in cutadapt_log
 
 
 def test_failed_adapter_change_leaves_cutadapt_and_downstream_incomplete(monkeypatch, tmp_path):
@@ -310,6 +311,73 @@ def test_missing_manifest_invalidates_unverified_cutadapt_and_downstream(monkeyp
     assert manifest["trimming"]["adapters_r1"] == ["AAAA"]
     assert manifest["trimming"]["adapters_r2"] == ["CCCC"]
     assert "completed phases lack an authoritative manifest" in capsys.readouterr().out
+
+
+def test_legacy_read_filtering_manifest_reprocesses_once_then_resumes(monkeypatch, tmp_path, capsys):
+    import json
+
+    workdir = run_pipeline(tmp_path, monkeypatch, single_end=False)
+    capsys.readouterr()
+    reference = tmp_path / "ref"
+    manifest_path = workdir / "status/manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest.pop("read_filtering")
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    raw_marker = workdir / "status/steps/fastqc_raw.done"
+    raw_marker.write_text("safe raw checkpoint\n", encoding="utf-8")
+
+    args = parse_args([
+        "run", str(workdir), "--reference", str(reference), "--stranded", "reverse", "--threads", "2",
+        "--aligner", "star", "--no-adapter-trimming",
+    ])
+    assert execute(args) == 0
+
+    first_output = capsys.readouterr().out
+    assert "legacy manifest lacks verified read-filtering policy" in first_output
+    assert raw_marker.read_text(encoding="utf-8") == "safe raw checkpoint\n"
+    cutadapt_log = workdir / "logs/steps/sample.cutadapt.log"
+    assert "--minimum-length 1" in cutadapt_log.read_text(encoding="utf-8")
+    current_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert current_manifest["read_filtering"] == {"minimum_length": 1, "pair_filter": "any"}
+
+    cutadapt_log.write_text("verified v0.2.4 output\n", encoding="utf-8")
+    assert execute(args) == 0
+
+    second_output = capsys.readouterr().out
+    assert "[skip] cutadapt" in second_output
+    assert cutadapt_log.read_text(encoding="utf-8") == "verified v0.2.4 output\n"
+
+
+def test_interrupted_legacy_filtering_reprocess_cannot_reuse_downstream(monkeypatch, tmp_path):
+    import json
+    import wulfrna.pipeline as pipeline
+
+    workdir = run_pipeline(tmp_path, monkeypatch, single_end=False)
+    reference = tmp_path / "ref"
+    manifest_path = workdir / "status/manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest.pop("read_filtering")
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    args = parse_args([
+        "run", str(workdir), "--reference", str(reference), "--stranded", "reverse", "--threads", "2",
+        "--aligner", "star", "--no-adapter-trimming",
+    ])
+
+    def fail_cutadapt(cmd, log_path, step, sample=None, log_note=None):
+        assert step == "cutadapt"
+        raise pipeline.PipelineError("simulated interruption", step=step, sample=sample)
+
+    monkeypatch.setattr(pipeline, "run_cmd", fail_cutadapt)
+    assert execute(args) == 1
+
+    assert (workdir / "status/steps/fastqc_raw.done").exists()
+    for phase in ["cutadapt", "fastqc_trimmed", "align", "quant", "aggregate", "multiqc"]:
+        assert not (workdir / f"status/steps/{phase}.done").exists()
+    assert json.loads(manifest_path.read_text(encoding="utf-8"))["read_filtering"] == {
+        "minimum_length": 1,
+        "pair_filter": "any",
+    }
 
 
 def test_star_tools_not_required_when_aligner_omitted(monkeypatch, tmp_path):

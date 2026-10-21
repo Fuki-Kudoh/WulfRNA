@@ -18,7 +18,7 @@ Pipeline steps: FastQC (raw) → Cutadapt → FastQC (trimmed) →
 optional STAR alignment → transcript quantification (Salmon or kallisto) →
 gene-level aggregation → MultiQC.
 
-Public-readiness note: WulfRNA v0.2.2 is a lightweight single-server
+Public-readiness note: WulfRNA v0.2.4 is a lightweight single-server
 bulk RNA-seq runner intended for local or HPC workstation use.
 
 ## 1) Prerequisites
@@ -116,7 +116,7 @@ Arguments:
 - `--single-end`, `--SE` (optional): switch layout from `paired_end` to `single_end`
 - `--adapter-r1 SEQUENCE` (repeatable): regular 3′ adapter candidate for read 1
 - `--adapter-r2 SEQUENCE` (repeatable, paired-end only): regular 3′ adapter candidate for read 2
-- `--no-adapter-trimming`: explicitly preserve the Cutadapt phase without removing adapters
+- `--no-adapter-trimming`: skip adapter removal while retaining the nonempty-read safety filter
 - `--fragment-length FLOAT` and `--fragment-sd FLOAT` (single-end kallisto only; both required and must be `> 0`)
 - `--min-mapping-rate FLOAT` (optional, default `0.90`): minimum acceptable tx2gene transcript mapping rate per sample (`0.0-1.0`)
 - `--dry-run` (optional): validate tools/reference/inputs, write separate dry-run metadata/status, then exit
@@ -155,10 +155,23 @@ supported. Choose sequences from the library preparation protocol: a FastQC
 adapter label does not establish the correct complete sequence, and WulfRNA does
 not silently substitute a generic Illumina or Nextera adapter.
 
+Cutadapt always applies `--minimum-length 1` after adapter processing, including
+with `--no-adapter-trimming`. Paired-end runs also use `--pair-filter=any`, so
+an entire pair is discarded when either mate is empty. This keeps retained R1
+and R2 records synchronized and prevents zero-length reads from reaching STAR.
+`--no-adapter-trimming` disables adapter matching only; it does not disable this
+safety filter.
+
 **Migration requirement:** runs that previously omitted adapter options must now
 provide explicit sequences or `--no-adapter-trimming`. Existing work directories
 whose manifests do not contain verified trimming metadata are invalidated from
 Cutadapt onward; raw FastQC output remains reusable.
+
+**v0.2.4 migration:** v0.2.3 and older manifests do not record the nonempty-read
+policy. On the first v0.2.4 execution, WulfRNA automatically invalidates
+Cutadapt and all downstream phases while preserving raw FastQC. A dry-run only
+reports this plan. To request the same rebuild explicitly, use
+`--force-from cutadapt`.
 
 ## 5) Minimal smoke test plan
 
@@ -231,7 +244,7 @@ A phase is skipped only when:
 Conservative compatibility rules:
 - If sample IDs changed: resume is blocked with an error.
 - If input layout changed (`paired_end` vs `single_end`): automatic resume is blocked with an error.
-- If the adapter mode or either ordered adapter list changed, if a legacy manifest lacks trimming metadata, or if completed Cutadapt/downstream checkpoints have no manifest: `cutadapt` and every downstream phase rerun; `fastqc_raw` remains reusable.
+- If the adapter mode or either ordered adapter list changed, if the read-filtering policy changed, if a legacy manifest lacks trimming or read-filtering metadata, or if completed Cutadapt/downstream checkpoints have no manifest: `cutadapt` and every downstream phase rerun; `fastqc_raw` remains reusable.
 - If `quantifier`, `reference_dir`, or `stranded` changed: `quant` and downstream phases rerun.
 - If `aligner` or STAR index content changed: `align` and downstream phases rerun when STAR alignment is enabled.
 - If `combined_tx2gene.tsv` fingerprint changed: `aggregate` and `multiqc` rerun.
