@@ -20,6 +20,8 @@ LAYOUT_PAIRED = "paired_end"
 LAYOUT_SINGLE = "single_end"
 TRIMMING_ADAPTERS = "adapters"
 TRIMMING_DISABLED = "disabled"
+MINIMUM_READ_LENGTH = 1
+PAIRED_READ_FILTER = "any"
 TERMINAL_STATUS_FILES = [
     "SUCCESS",
     "FAILED",
@@ -288,6 +290,14 @@ def trimming_config_from_args(args: argparse.Namespace) -> TrimmingConfig:
     )
 
 
+def read_filtering_policy(layout: str) -> Dict[str, object]:
+    """Return the fixed Cutadapt safety policy recorded in run manifests."""
+    return {
+        "minimum_length": MINIMUM_READ_LENGTH,
+        "pair_filter": PAIRED_READ_FILTER if layout == LAYOUT_PAIRED else None,
+    }
+
+
 def cutadapt_output_paths(workdir: Path, sample: Sample, layout: str) -> Tuple[List[Path], Path]:
     report_path = workdir / "qc" / "cutadapt" / f"{sample.sample_id}.cutadapt.json"
     if layout == LAYOUT_SINGLE:
@@ -308,7 +318,9 @@ def build_cutadapt_command(
     trimming: TrimmingConfig,
 ) -> List[str]:
     """Build a Cutadapt argument array without shell interpolation."""
-    cmd = ["cutadapt", "-j", str(max(1, threads // 2))]
+    cmd = ["cutadapt", "-j", str(max(1, threads // 2)), "--minimum-length", str(MINIMUM_READ_LENGTH)]
+    if layout == LAYOUT_PAIRED:
+        cmd.append(f"--pair-filter={PAIRED_READ_FILTER}")
     if trimming.mode == TRIMMING_ADAPTERS:
         for adapter in trimming.adapters_r1:
             cmd.extend(["-a", adapter])
@@ -1025,6 +1037,11 @@ def compare_manifest(existing: Dict[str, object], current: Dict[str, object]) ->
             force_from("cutadapt", "legacy manifest lacks verified trimming configuration")
         else:
             force_from("cutadapt", "trimming configuration changed")
+    if existing.get("read_filtering") != current.get("read_filtering"):
+        if "read_filtering" not in existing:
+            force_from("cutadapt", "legacy manifest lacks verified read-filtering policy")
+        else:
+            force_from("cutadapt", "read-filtering policy changed")
     if existing.get("aligner", "none") != current.get("aligner", "none"):
         force_from("align", "aligner changed")
     existing_reference_files = existing.get("reference_files", {})
@@ -1105,6 +1122,7 @@ def execute(args: argparse.Namespace) -> int:
             "aligner": args.aligner,
             "layout": layout,
             "trimming": trimming.as_manifest(),
+            "read_filtering": read_filtering_policy(layout),
             "sample_ids": [sample.sample_id for sample in samples],
             "reference_files": {
                 "index": str(refs["index"]),
@@ -1193,7 +1211,7 @@ def execute(args: argparse.Namespace) -> int:
                     cmd = build_cutadapt_command(workdir, sample, args.threads, layout, trimming)
                     log_note = (
                         "Adapter trimming explicitly disabled by --no-adapter-trimming; "
-                        "Cutadapt is preserving the trimming phase without adapter removal."
+                        "adapter removal is skipped, but minimum-length safety filtering remains active."
                         if trimming.mode == TRIMMING_DISABLED
                         else None
                     )

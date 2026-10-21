@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.2.4] - 2026-10-21
+
+### Fixed
+
+- Cutadapt now removes reads shorter than 1 nt after adapter processing, preventing zero-length reads from reaching STAR.
+- Paired-end filtering explicitly uses `--pair-filter=any`, so both mates are discarded when either mate is empty and retained pairs remain synchronized.
+
+### Changed
+
+- Run manifests now record the effective read-filtering policy. Manifests from v0.2.3 and earlier that lack this metadata automatically invalidate Cutadapt and all downstream phases while preserving raw FastQC.
+- `--no-adapter-trimming` continues to disable adapter removal only; nonempty-read safety filtering remains active.
+
+### Validation
+
+- Added real-Cutadapt paired-end and single-end tests covering pre-existing empty reads and reads made empty by adapter removal.
+- Added resume and dry-run regression coverage for legacy manifests without read-filtering metadata.
+
 ## [0.2.2] - 2026-07-21
 
 ### Added

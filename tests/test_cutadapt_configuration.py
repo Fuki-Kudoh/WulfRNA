@@ -11,6 +11,8 @@ from wulfrna.cli import main, parse_args
 from wulfrna.pipeline import (
     LAYOUT_PAIRED,
     LAYOUT_SINGLE,
+    MINIMUM_READ_LENGTH,
+    PAIRED_READ_FILTER,
     PHASES,
     TRIMMING_ADAPTERS,
     TRIMMING_DISABLED,
@@ -23,6 +25,7 @@ from wulfrna.pipeline import (
     invalidate_phase_markers,
     load_manifest,
     mark_phase_done,
+    read_filtering_policy,
     should_run_phase,
     step_done_file,
     validate_cutadapt_report,
@@ -130,6 +133,8 @@ def test_build_cutadapt_command_for_paired_end_preserves_paths_and_all_adapters(
 
     cmd = build_cutadapt_command(tmp_path, sample, 8, LAYOUT_PAIRED, trimming)
 
+    assert cmd[cmd.index("--minimum-length") + 1] == "1"
+    assert f"--pair-filter={PAIRED_READ_FILTER}" in cmd
     assert [cmd[i + 1] for i, value in enumerate(cmd) if value == "-a"] == ["AAAA", "CCCC"]
     assert [cmd[i + 1] for i, value in enumerate(cmd) if value == "-A"] == ["GGGG", "TTTT"]
     assert cmd[cmd.index("-o") + 1] == str(tmp_path / "trimmed/sample_R1.trimmed.fastq.gz")
@@ -144,6 +149,8 @@ def test_build_cutadapt_command_for_single_end_uses_only_r1(tmp_path):
 
     cmd = build_cutadapt_command(tmp_path, sample, 3, LAYOUT_SINGLE, trimming)
 
+    assert cmd[cmd.index("--minimum-length") + 1] == str(MINIMUM_READ_LENGTH)
+    assert all(not value.startswith("--pair-filter") for value in cmd)
     assert [cmd[i + 1] for i, value in enumerate(cmd) if value == "-a"] == ["AAAA", "CCCC"]
     assert "-A" not in cmd
     assert "-p" not in cmd
@@ -157,6 +164,8 @@ def test_build_cutadapt_command_for_disabled_trimming_omits_adapter_options(tmp_
 
     cmd = build_cutadapt_command(tmp_path, sample, 4, LAYOUT_PAIRED, trimming)
 
+    assert cmd[cmd.index("--minimum-length") + 1] == "1"
+    assert "--pair-filter=any" in cmd
     assert "-a" not in cmd
     assert "-A" not in cmd
 
@@ -232,6 +241,7 @@ def manifest(trimming):
         "tx2gene_fingerprint": {"sha256": "tx"},
         "gene_annotation_fingerprint": {"sha256": "annotation"},
         "trimming": trimming,
+        "read_filtering": read_filtering_policy(LAYOUT_PAIRED),
     }
 
 
@@ -271,6 +281,31 @@ def test_legacy_manifest_without_trimming_metadata_invalidates_from_cutadapt():
 
     assert forced_phase == "cutadapt"
     assert "legacy manifest lacks verified trimming configuration" in reasons
+
+
+def test_legacy_manifest_without_read_filtering_metadata_invalidates_from_cutadapt():
+    existing = manifest(trimming_manifest())
+    existing.pop("read_filtering")
+
+    forced_phase, reasons = compare_manifest(existing, manifest(trimming_manifest()))
+
+    assert forced_phase == "cutadapt"
+    assert "legacy manifest lacks verified read-filtering policy" in reasons
+
+
+def test_changed_read_filtering_policy_invalidates_from_cutadapt():
+    existing = manifest(trimming_manifest())
+    current = manifest(trimming_manifest())
+    current["read_filtering"] = {"minimum_length": 2, "pair_filter": "any"}
+
+    forced_phase, reasons = compare_manifest(existing, current)
+
+    assert forced_phase == "cutadapt"
+    assert "read-filtering policy changed" in reasons
+
+
+def test_single_end_read_filtering_policy_has_no_pair_filter():
+    assert read_filtering_policy(LAYOUT_SINGLE) == {"minimum_length": 1, "pair_filter": None}
 
 
 def test_interrupted_configuration_change_cannot_reuse_downstream_markers(tmp_path):
@@ -328,6 +363,7 @@ def test_dry_run_preserves_completed_run_provenance_status_and_markers(monkeypat
         "tx2gene_fingerprint": fingerprint_file(reference / "combined_tx2gene.tsv"),
         "gene_annotation_fingerprint": fingerprint_file(reference / "combined_gene_annotation.tsv"),
     }
+    existing.pop("read_filtering")
     (workdir / "status/steps").mkdir(parents=True)
     for phase in [phase for phase in PHASES if phase != "align"]:
         mark_phase_done(workdir, phase)
@@ -356,9 +392,9 @@ def test_dry_run_preserves_completed_run_provenance_status_and_markers(monkeypat
             "--threads",
             "2",
             "--adapter-r1",
-            "GGGG",
+            "AAAA",
             "--adapter-r2",
-            "TTTT",
+            "CCCC",
             "--dry-run",
         ]
     )
@@ -376,7 +412,89 @@ def test_dry_run_preserves_completed_run_provenance_status_and_markers(monkeypat
     assert (workdir / "status/dry_run/summary.txt").exists()
     assert (workdir / "status/SUCCESS").exists()
     assert not (workdir / "status/FAILED").exists()
-    assert "would invalidate cutadapt" in capsys.readouterr().out
+    output = capsys.readouterr().out
+    assert "would invalidate cutadapt" in output
+    assert "legacy manifest lacks verified read-filtering policy" in output
+
+
+def write_fastq(path: Path, records):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with gzip.open(path, "wt", encoding="utf-8") as f:
+        for read_id, sequence in records:
+            f.write(f"@{read_id}\n{sequence}\n+\n{'I' * len(sequence)}\n")
+
+
+def read_fastq(path: Path):
+    with gzip.open(path, "rt", encoding="utf-8") as f:
+        lines = f.read().splitlines()
+    assert len(lines) % 4 == 0
+    records = []
+    for index in range(0, len(lines), 4):
+        header, sequence, separator, quality = lines[index : index + 4]
+        assert header.startswith("@")
+        assert separator.startswith("+")
+        assert len(sequence) == len(quality)
+        records.append((header[1:].split()[0], sequence, quality))
+    return records
+
+
+@pytest.mark.skipif(shutil.which("cutadapt") is None, reason="real Cutadapt is not installed")
+def test_real_cutadapt_paired_filter_removes_empty_mates_and_preserves_synchronization(tmp_path):
+    r1_path = tmp_path / "fastq/sample_R1.fastq.gz"
+    r2_path = tmp_path / "fastq/sample_R2.fastq.gz"
+    write_fastq(
+        r1_path,
+        [
+            ("valid/1", "GATT"),
+            ("empty_r1/1", ""),
+            ("empty_r2/1", "GAGA"),
+            ("both_empty/1", ""),
+            ("trimmed_empty/1", "AAAA"),
+        ],
+    )
+    write_fastq(
+        r2_path,
+        [
+            ("valid/2", "TGCA"),
+            ("empty_r1/2", "ACAC"),
+            ("empty_r2/2", ""),
+            ("both_empty/2", ""),
+            ("trimmed_empty/2", "CCCC"),
+        ],
+    )
+    sample = Sample("sample", r1_path, r2_path)
+    trimming = TrimmingConfig(TRIMMING_ADAPTERS, ("AAAA",), ("CCCC",))
+    command = build_cutadapt_command(tmp_path, sample, 2, LAYOUT_PAIRED, trimming)
+    (tmp_path / "trimmed").mkdir()
+    (tmp_path / "qc/cutadapt").mkdir(parents=True)
+
+    subprocess.run(command, check=True, capture_output=True, text=True)
+
+    validate_cutadapt_report(tmp_path / "qc/cutadapt/sample.cutadapt.json", trimming, LAYOUT_PAIRED)
+    r1_records = read_fastq(tmp_path / "trimmed/sample_R1.trimmed.fastq.gz")
+    r2_records = read_fastq(tmp_path / "trimmed/sample_R2.trimmed.fastq.gz")
+    assert r1_records == [("valid/1", "GATT", "IIII")]
+    assert r2_records == [("valid/2", "TGCA", "IIII")]
+    assert [read_id.removesuffix("/1") for read_id, _, _ in r1_records] == [
+        read_id.removesuffix("/2") for read_id, _, _ in r2_records
+    ]
+    assert all(sequence for _, sequence, _ in [*r1_records, *r2_records])
+
+
+@pytest.mark.skipif(shutil.which("cutadapt") is None, reason="real Cutadapt is not installed")
+def test_real_cutadapt_single_end_filter_removes_empty_reads(tmp_path):
+    input_path = tmp_path / "fastq/sample.fastq.gz"
+    write_fastq(input_path, [("valid", "GATT"), ("empty", ""), ("trimmed_empty", "AAAA")])
+    sample = Sample("sample", input_path)
+    trimming = TrimmingConfig(TRIMMING_ADAPTERS, ("AAAA",), ())
+    command = build_cutadapt_command(tmp_path, sample, 2, LAYOUT_SINGLE, trimming)
+    (tmp_path / "trimmed").mkdir()
+    (tmp_path / "qc/cutadapt").mkdir(parents=True)
+
+    subprocess.run(command, check=True, capture_output=True, text=True)
+
+    validate_cutadapt_report(tmp_path / "qc/cutadapt/sample.cutadapt.json", trimming, LAYOUT_SINGLE)
+    assert read_fastq(tmp_path / "trimmed/sample.trimmed.fastq.gz") == [("valid", "GATT", "IIII")]
 
 
 @pytest.mark.skipif(shutil.which("cutadapt") is None, reason="real Cutadapt is not installed")
@@ -401,10 +519,8 @@ def test_real_cutadapt_removes_configured_adapter_and_report_validates(tmp_path)
 @pytest.mark.skipif(shutil.which("cutadapt") is None, reason="real Cutadapt is not installed")
 def test_real_cutadapt_explicit_no_trimming_preserves_read_and_validates_empty_adapters(tmp_path):
     input_path = tmp_path / "fastq/sample.fastq.gz"
-    input_path.parent.mkdir()
     sequence = "ACGTACGTAGATCGGAAGAGC"
-    with gzip.open(input_path, "wt", encoding="utf-8") as f:
-        f.write(f"@read1\n{sequence}\n+\n{'I' * len(sequence)}\n")
+    write_fastq(input_path, [("read1", sequence), ("empty", "")])
     sample = Sample("sample", input_path)
     trimming = TrimmingConfig(TRIMMING_DISABLED, (), ())
     command = build_cutadapt_command(tmp_path, sample, 2, LAYOUT_SINGLE, trimming)
@@ -414,5 +530,6 @@ def test_real_cutadapt_explicit_no_trimming_preserves_read_and_validates_empty_a
     subprocess.run(command, check=True, capture_output=True, text=True)
 
     validate_cutadapt_report(tmp_path / "qc/cutadapt/sample.cutadapt.json", trimming, LAYOUT_SINGLE)
-    with gzip.open(tmp_path / "trimmed/sample.trimmed.fastq.gz", "rt", encoding="utf-8") as f:
-        assert f.read().splitlines()[1] == sequence
+    assert read_fastq(tmp_path / "trimmed/sample.trimmed.fastq.gz") == [
+        ("read1", sequence, "I" * len(sequence))
+    ]
